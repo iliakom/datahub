@@ -25,7 +25,7 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class UrnValidationUtil {
-  public static final int URN_NUM_BYTES_LIMIT = 512;
+  public static final int URN_NUM_BYTES_LIMIT = 2048;
   // Related to BrowsePathv2
   public static final String URN_DELIMITER_SEPARATOR = "␟";
   // https://docs.datahub.com/docs/what/urn/#restrictions
