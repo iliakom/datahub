@@ -1,17 +1,22 @@
 package com.linkedin.metadata.utils.metrics;
 
 import com.codahale.metrics.MetricRegistry;
+import com.google.common.util.concurrent.AtomicDouble;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
+import javax.annotation.Nullable;
 import lombok.Builder;
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -20,6 +25,26 @@ public class MetricUtils {
   /* Shared OpenTelemetry & Micrometer */
   public static final String DROPWIZARD_METRIC = "dwizMetric";
   public static final String DROPWIZARD_NAME = "dwizName";
+
+  /* Micrometer. See https://prometheus.io/docs/practices/naming/ */
+  public static final String MESSAGING_QUEUE_TIME = "messaging.queue.time";
+
+  /**
+   * @deprecated Use {@link #MESSAGING_QUEUE_TIME} with {@link #MESSAGING_SYSTEM} tag.
+   */
+  @Deprecated public static final String KAFKA_MESSAGE_QUEUE_TIME = "kafka.message.queue.time";
+
+  public static final String DATAHUB_REQUEST_HOOK_QUEUE_TIME = "datahub.request.hook.queue.time";
+  public static final String DATAHUB_REQUEST_COUNT = "datahub_request_count";
+
+  /** Human login attempts (success/failure). Tags: outcome, login_source, denial_reason. */
+  public static final String DATAHUB_LOGIN = "datahub.login";
+
+  public static final String MESSAGING_SYSTEM_KAFKA = "kafka";
+  public static final String MESSAGING_SYSTEM_PGQUEUE = "pgqueue";
+  public static final String MESSAGING_TOPIC = "topic";
+  public static final String MESSAGING_CONSUMER_GROUP = "consumer.group";
+  public static final String MESSAGING_PRIORITY = "messaging.priority";
 
   /* OpenTelemetry */
   public static final String CACHE_HIT_ATTR = "cache.hit";
@@ -37,28 +62,78 @@ public class MetricUtils {
 
   @Deprecated public static final String DELIMITER = "_";
 
-  private final MeterRegistry registry;
-  private final Map<String, Timer> legacyTimeCache = new ConcurrentHashMap<>();
+  @Builder.Default @NonNull private final MeterRegistry registry = new CompositeMeterRegistry();
 
-  public Optional<MeterRegistry> getRegistry() {
-    return Optional.ofNullable(registry);
+  /**
+   * When true, skip the per-request {@link #DATAHUB_REQUEST_COUNT} Micrometer counter. Set when
+   * usage aggregation Micrometer export owns that meter name (flush tags differ from the legacy
+   * {@code user_category} set; Micrometer allows only one tag-key set per name).
+   *
+   * <p>Default false so Mockito mocks keep the legacy path unless explicitly stubbed.
+   */
+  @Builder.Default private final boolean suppressLegacyRequestCountMicrometer = false;
+
+  private static final Map<String, Timer> legacyTimeCache = new ConcurrentHashMap<>();
+  private static final Map<String, Counter> legacyCounterCache = new ConcurrentHashMap<>();
+  private static final Map<String, DistributionSummary> legacyHistogramCache =
+      new ConcurrentHashMap<>();
+  private static final Map<String, Gauge> legacyGaugeCache = new ConcurrentHashMap<>();
+  private static final Map<String, Counter> micrometerCounterCache = new ConcurrentHashMap<>();
+  private static final Map<String, Timer> micrometerTimerCache = new ConcurrentHashMap<>();
+  private static final Map<String, DistributionSummary> micrometerDistributionCache =
+      new ConcurrentHashMap<>();
+  // For state-based gauges (like throttled state)
+  private static final Map<String, AtomicDouble> gaugeStates = new ConcurrentHashMap<>();
+
+  public MeterRegistry getRegistry() {
+    return registry;
+  }
+
+  public boolean isSuppressLegacyRequestCountMicrometer() {
+    return suppressLegacyRequestCountMicrometer;
+  }
+
+  /**
+   * Records end-to-end queue lag for an inbound metadata message (legacy Dropwizard {@code
+   * kafkaLag} histogram + transport-neutral Micrometer timer). For pgQueue, pass {@code priority}
+   * (WFQ band).
+   */
+  public static void recordInboundMessageQueueLag(
+      MetricUtils metricUtils,
+      Class<?> histogramScopeClass,
+      String logicalTopic,
+      String consumerGroupId,
+      long enqueuedAtEpochMillis,
+      String messagingSystem,
+      @Nullable Integer priority) {
+    long queueTimeMs = System.currentTimeMillis() - enqueuedAtEpochMillis;
+    metricUtils.histogram(histogramScopeClass, "kafkaLag", queueTimeMs);
+
+    List<String> tags = new ArrayList<>();
+    tags.add(MESSAGING_SYSTEM);
+    tags.add(messagingSystem);
+    tags.add(MESSAGING_TOPIC);
+    tags.add(logicalTopic);
+    tags.add(MESSAGING_CONSUMER_GROUP);
+    tags.add(consumerGroupId);
+    if (MESSAGING_SYSTEM_PGQUEUE.equals(messagingSystem) && priority != null) {
+      tags.add(MESSAGING_PRIORITY);
+      tags.add(String.valueOf(priority));
+    }
+
+    metricUtils
+        .getRegistry()
+        .timer(MESSAGING_QUEUE_TIME, tags.toArray(String[]::new))
+        .record(Duration.ofMillis(queueTimeMs));
   }
 
   @Deprecated
   public void time(String dropWizardMetricName, long durationNanos) {
-    getRegistry()
-        .ifPresent(
-            meterRegistry -> {
-              Timer timer =
-                  legacyTimeCache.computeIfAbsent(
-                      dropWizardMetricName,
-                      name ->
-                          Timer.builder(name)
-                              .tags(DROPWIZARD_METRIC, "true")
-                              .publishPercentiles(0.5, 0.75, 0.95, 0.98, 0.99, 0.999)
-                              .register(meterRegistry));
-              timer.record(durationNanos, TimeUnit.NANOSECONDS);
-            });
+    Timer timer =
+        legacyTimeCache.computeIfAbsent(
+            dropWizardMetricName,
+            name -> Timer.builder(name).tags(DROPWIZARD_METRIC, "true").register(registry));
+    timer.record(durationNanos, TimeUnit.NANOSECONDS);
   }
 
   @Deprecated
@@ -79,38 +154,128 @@ public class MetricUtils {
 
   @Deprecated
   public void increment(String metricName, double increment) {
-    getRegistry()
-        .ifPresent(
-            meterRegistry ->
-                Counter.builder(MetricRegistry.name(metricName))
+    Counter counter =
+        legacyCounterCache.computeIfAbsent(
+            metricName,
+            name ->
+                Counter.builder(MetricRegistry.name(name))
                     .tag(DROPWIZARD_METRIC, "true")
-                    .register(meterRegistry)
-                    .increment(increment));
+                    .register(registry));
+    counter.increment(increment);
   }
 
+  /**
+   * Increment a counter using Micrometer metrics library.
+   *
+   * @param metricName The name of the metric
+   * @param increment The value to increment by
+   * @param tags The tags to associate with the metric (can be empty)
+   */
+  public void incrementMicrometer(String metricName, double increment, String... tags) {
+    // Create a cache key that includes both metric name and tags
+    String cacheKey = createCacheKey(metricName, tags);
+    Counter counter =
+        micrometerCounterCache.computeIfAbsent(cacheKey, key -> registry.counter(metricName, tags));
+    counter.increment(increment);
+  }
+
+  /**
+   * Record a timer measurement using Micrometer metrics library.
+   *
+   * @param metricName The name of the metric
+   * @param durationNanos The duration in nanoseconds
+   * @param tags The tags to associate with the metric (can be empty)
+   */
+  public void recordTimer(String metricName, long durationNanos, String... tags) {
+    String cacheKey = createCacheKey(metricName, tags);
+    Timer timer =
+        micrometerTimerCache.computeIfAbsent(
+            cacheKey, key -> Timer.builder(metricName).tags(tags).register(registry));
+    timer.record(durationNanos, TimeUnit.NANOSECONDS);
+  }
+
+  /**
+   * Record a distribution summary (histogram) using Micrometer metrics library.
+   *
+   * @param metricName The name of the metric
+   * @param value The value to record
+   * @param tags The tags to associate with the metric (can be empty)
+   */
+  public void recordDistribution(String metricName, long value, String... tags) {
+    String cacheKey = createCacheKey(metricName, tags);
+    DistributionSummary summary =
+        micrometerDistributionCache.computeIfAbsent(
+            cacheKey, key -> DistributionSummary.builder(metricName).tags(tags).register(registry));
+    summary.record(value);
+  }
+
+  /**
+   * Creates a cache key for a metric with its tags.
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   *   <li>No tags: {@code createCacheKey("datahub.request.count")} returns {@code
+   *       "datahub.request.count"}
+   *   <li>With tags: {@code createCacheKey("datahub.request.count", "user_category", "regular",
+   *       "agent_class", "browser")} returns {@code
+   *       "datahub.request.count|user_category=regular|agent_class=browser"}
+   * </ul>
+   *
+   * @param metricName the name of the metric
+   * @param tags the tags to associate with the metric (key-value pairs)
+   * @return a string key that uniquely identifies this metric+tags combination
+   */
+  private String createCacheKey(String metricName, String... tags) {
+    if (tags.length == 0) {
+      return metricName;
+    }
+
+    StringBuilder keyBuilder = new StringBuilder(metricName);
+    for (int i = 0; i < tags.length; i += 2) {
+      if (i + 1 < tags.length) {
+        keyBuilder.append("|").append(tags[i]).append("=").append(tags[i + 1]);
+      }
+    }
+    return keyBuilder.toString();
+  }
+
+  /**
+   * Set a state-based gauge value (e.g., for binary states like throttled/not throttled). This is
+   * more efficient than repeatedly calling gauge() with different suppliers.
+   *
+   * @param clazz The class for namespacing
+   * @param metricName The metric name
+   * @param value The gauge value to set
+   */
   @Deprecated
-  public void gauge(Class<?> clazz, String metricName, Supplier<? extends Number> valueSupplier) {
+  public void setGaugeValue(Class<?> clazz, String metricName, double value) {
+    String name = MetricRegistry.name(clazz, metricName);
 
-    getRegistry()
-        .ifPresent(
-            meterRegistry -> {
-              String name = com.codahale.metrics.MetricRegistry.name(clazz, metricName);
+    // Get or create the state holder
+    AtomicDouble state = gaugeStates.computeIfAbsent(name, k -> new AtomicDouble(0));
 
-              Gauge.builder(name, valueSupplier, supplier -> supplier.get().doubleValue())
-                  .tag(DROPWIZARD_METRIC, "true")
-                  .register(meterRegistry);
-            });
+    // Register the gauge if not already registered
+    legacyGaugeCache.computeIfAbsent(
+        name,
+        key ->
+            Gauge.builder(key, state, AtomicDouble::get)
+                .tag(DROPWIZARD_METRIC, "true")
+                .register(registry));
+
+    // Update the value
+    state.set(value);
   }
 
   @Deprecated
   public void histogram(Class<?> clazz, String metricName, long value) {
-    getRegistry()
-        .ifPresent(
-            meterRegistry ->
-                DistributionSummary.builder(MetricRegistry.name(clazz, metricName))
-                    .tag(DROPWIZARD_METRIC, "true")
-                    .register(meterRegistry)
-                    .record(value));
+    String name = MetricRegistry.name(clazz, metricName);
+    DistributionSummary summary =
+        legacyHistogramCache.computeIfAbsent(
+            name,
+            key ->
+                DistributionSummary.builder(key).tag(DROPWIZARD_METRIC, "true").register(registry));
+    summary.record(value);
   }
 
   @Deprecated
@@ -121,5 +286,32 @@ public class MetricUtils {
   @Deprecated
   public static String name(Class<?> clazz, String... names) {
     return MetricRegistry.name(clazz.getName(), names);
+  }
+
+  public static double[] parsePercentiles(String percentilesConfig) {
+    if (percentilesConfig == null || percentilesConfig.trim().isEmpty()) {
+      // Default percentiles
+      return new double[] {0.5, 0.95, 0.99};
+    }
+
+    return commaDelimitedDoubles(percentilesConfig);
+  }
+
+  public static double[] parseSLOSeconds(String sloConfig) {
+    if (sloConfig == null || sloConfig.trim().isEmpty()) {
+      // Default SLO seconds
+      return new double[] {60, 300, 900, 1800, 3600};
+    }
+
+    return commaDelimitedDoubles(sloConfig);
+  }
+
+  private static double[] commaDelimitedDoubles(String value) {
+    String[] parts = value.split(",");
+    double[] result = new double[parts.length];
+    for (int i = 0; i < parts.length; i++) {
+      result[i] = Double.parseDouble(parts[i].trim());
+    }
+    return result;
   }
 }

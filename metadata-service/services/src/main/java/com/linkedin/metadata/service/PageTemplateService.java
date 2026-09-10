@@ -1,15 +1,18 @@
 package com.linkedin.metadata.service;
 
+import com.datahub.authorization.AuthUtil;
 import com.linkedin.common.AuditStamp;
 import com.linkedin.common.urn.Urn;
 import com.linkedin.common.urn.UrnUtils;
 import com.linkedin.entity.EntityResponse;
 import com.linkedin.entity.client.EntityClient;
 import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.authorization.PoliciesConfig;
 import com.linkedin.metadata.entity.AspectUtils;
 import com.linkedin.metadata.key.DataHubPageTemplateKey;
 import com.linkedin.metadata.utils.EntityKeyUtils;
 import com.linkedin.mxe.MetadataChangeProposal;
+import com.linkedin.template.DataHubPageTemplateAssetSummary;
 import com.linkedin.template.DataHubPageTemplateProperties;
 import com.linkedin.template.DataHubPageTemplateRow;
 import com.linkedin.template.DataHubPageTemplateRowArray;
@@ -18,25 +21,41 @@ import com.linkedin.template.DataHubPageTemplateVisibility;
 import com.linkedin.template.PageTemplateScope;
 import com.linkedin.template.PageTemplateSurfaceType;
 import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.openapi.exception.UnauthorizedException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class PageTemplateService {
   private final EntityClient entityClient;
+  private static final String DEFAULT_HOME_PAGE_TEMPLATE_URN =
+      "urn:li:dataHubPageTemplate:home_default_1";
 
   public PageTemplateService(@Nonnull EntityClient entityClient) {
     this.entityClient = entityClient;
+  }
+
+  public Urn upsertPageTemplate(
+      @Nonnull OperationContext opContext,
+      @Nullable final String urn,
+      @Nonnull final List<DataHubPageTemplateRow> rows,
+      @Nonnull final PageTemplateScope scope,
+      @Nonnull final PageTemplateSurfaceType surfaceType) {
+    return upsertPageTemplate(opContext, urn, rows, scope, surfaceType, null);
   }
 
   /**
    * Upserts a DataHub page template. If the page template with the provided urn already exists,
    * then it will be overwritten.
    *
-   * <p>This method assumes that authorization has already been verified at the calling layer.
+   * <p>Callers must hold MANAGE_HOME_PAGE_TEMPLATES_PRIVILEGE to create or modify GLOBAL-scoped
+   * templates, or to modify any template whose existing scope is GLOBAL.
    *
    * @return the URN of the new page template.
    */
@@ -45,7 +64,8 @@ public class PageTemplateService {
       @Nullable final String urn,
       @Nonnull final List<DataHubPageTemplateRow> rows,
       @Nonnull final PageTemplateScope scope,
-      @Nonnull final PageTemplateSurfaceType surfaceType) {
+      @Nonnull final PageTemplateSurfaceType surfaceType,
+      @Nullable final DataHubPageTemplateAssetSummary assetSummary) {
     Objects.requireNonNull(rows, "rows must not be null");
     Objects.requireNonNull(scope, "scope must not be null");
     Objects.requireNonNull(surfaceType, "surfaceType must not be null");
@@ -66,6 +86,27 @@ public class PageTemplateService {
     DataHubPageTemplateProperties properties = new DataHubPageTemplateProperties();
     DataHubPageTemplateProperties existingProperties =
         getPageTemplateProperties(opContext, templateUrn);
+
+    // Prevent scope-hijacking: a low-privileged user must not be able to overwrite a GLOBAL
+    // template by supplying its URN with scope=PERSONAL in the request. Check the persisted scope,
+    // not the caller-supplied scope.
+    if (existingProperties != null
+        && existingProperties.getVisibility() != null
+        && PageTemplateScope.GLOBAL.equals(existingProperties.getVisibility().getScope())
+        && !AuthUtil.isAuthorized(opContext, PoliciesConfig.MANAGE_HOME_PAGE_TEMPLATES_PRIVILEGE)) {
+      throw new UnauthorizedException(
+          String.format(
+              "User is unauthorized to modify global page template with urn %s", templateUrn));
+    }
+
+    // Prevent privilege escalation: creating or re-scoping a template to GLOBAL also requires the
+    // manage privilege.
+    if (PageTemplateScope.GLOBAL.equals(scope)
+        && !AuthUtil.isAuthorized(opContext, PoliciesConfig.MANAGE_HOME_PAGE_TEMPLATES_PRIVILEGE)) {
+      throw new UnauthorizedException(
+          "User is unauthorized to create or modify global page templates.");
+    }
+
     if (existingProperties != null) {
       properties = existingProperties;
     } else {
@@ -76,6 +117,10 @@ public class PageTemplateService {
     checkModulesExistInRows(opContext, rows);
 
     properties.setRows(new DataHubPageTemplateRowArray(rows));
+
+    if (assetSummary != null) {
+      properties.setAssetSummary(assetSummary);
+    }
 
     DataHubPageTemplateSurface surface = new DataHubPageTemplateSurface();
     surface.setSurfaceType(surfaceType);
@@ -150,5 +195,76 @@ public class PageTemplateService {
                     }
                   });
         });
+  }
+
+  /**
+   * Deletes a DataHub page template.
+   *
+   * @param opContext the operation context
+   * @param templateUrn the URN of the page template to delete
+   */
+  public void deletePageTemplate(
+      @Nonnull OperationContext opContext, @Nonnull final Urn templateUrn) {
+    Objects.requireNonNull(templateUrn, "templateUrn must not be null");
+
+    try {
+      checkDeleteTemplatePermissions(opContext, templateUrn);
+
+      entityClient.deleteEntity(opContext, templateUrn);
+
+      // Asynchronously delete all references to the entity (to return quickly)
+      CompletableFuture.runAsync(
+          () -> {
+            try {
+              entityClient.deleteEntityReferences(opContext, templateUrn);
+            } catch (Exception e) {
+              log.error(
+                  String.format(
+                      "Caught exception while attempting to clear all entity references for PageTemplate with urn %s",
+                      templateUrn),
+                  e);
+            }
+          });
+
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Failed to delete PageTemplate with urn %s", templateUrn), e);
+    }
+  }
+
+  /**
+   * Ensures that a page template exists, and uses the page template properties to determine if the
+   * user can delete this template. PERSONAL templates can only be deleted by the user that created
+   * them. GLOBAL templates can only be deleted by those with the manage privilege.
+   */
+  public void checkDeleteTemplatePermissions(
+      @Nonnull OperationContext opContext, @Nonnull final Urn templateUrn) {
+
+    if (Objects.equals(templateUrn.toString(), DEFAULT_HOME_PAGE_TEMPLATE_URN)) {
+      throw new UnauthorizedException("Attempted to delete the default page template");
+    }
+
+    DataHubPageTemplateProperties properties = getPageTemplateProperties(opContext, templateUrn);
+
+    if (properties == null) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Attempted to delete a page template that does not exist with urn %s", templateUrn));
+    }
+
+    if (properties.getVisibility().getScope().equals(PageTemplateScope.GLOBAL)
+        && !AuthUtil.isAuthorized(opContext, PoliciesConfig.MANAGE_HOME_PAGE_TEMPLATES_PRIVILEGE)) {
+      throw new UnauthorizedException("User is unauthorized to delete global templates.");
+    }
+
+    if (properties.getVisibility().getScope().equals(PageTemplateScope.PERSONAL)
+        && !properties
+            .getCreated()
+            .getActor()
+            .toString()
+            .equals(opContext.getSessionAuthentication().getActor().toUrnStr())) {
+      throw new UnauthorizedException(
+          "Attempted to delete personal a page template that was not created by the actor");
+    }
   }
 }

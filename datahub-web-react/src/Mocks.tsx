@@ -5,7 +5,6 @@ import { VIEW_ENTITY_PAGE } from '@app/entity/shared/constants';
 import { GenericEntityProperties } from '@app/entity/shared/types';
 import { ViewBuilderState } from '@app/entity/view/types';
 import { EntityCapabilityType } from '@app/entityV2/Entity';
-import { FetchedEntity } from '@app/lineage/types';
 import { DEFAULT_APP_CONFIG } from '@src/appConfigContext';
 
 import { AppConfigDocument, GetEntityCountsDocument } from '@graphql/app.generated';
@@ -32,7 +31,6 @@ import { GetTagDocument } from '@graphql/tag.generated';
 import { GetUserDocument } from '@graphql/user.generated';
 import {
     AppConfig,
-    BusinessAttribute,
     Container,
     DataFlow,
     DataHubView,
@@ -62,7 +60,7 @@ import {
     SearchResult,
 } from '@types';
 
-export const entityPrivileges: EntityPrivileges = {
+const entityPrivileges: EntityPrivileges = {
     canEditLineage: true,
     canEditDomains: true,
     canEditDataProducts: true,
@@ -85,6 +83,7 @@ export const entityPrivileges: EntityPrivileges = {
     canViewDatasetUsage: true,
     canViewDatasetProfile: true,
     canViewDatasetOperations: true,
+    canManageAssetSummary: true,
     __typename: 'EntityPrivileges',
 };
 
@@ -122,6 +121,7 @@ export const user1 = {
                     },
                 },
                 associatedUrn: 'urn:li:corpuser:1',
+                attribution: null,
             },
         ],
     },
@@ -195,12 +195,13 @@ const user2 = {
                     },
                 },
                 associatedUrn: 'urn:li:corpuser:3',
+                attribution: null,
             },
         ],
     },
     settings: {
         __typename: 'CorpUserSettings',
-        appearance: { __typename: 'CorpUserAppearanceSettings', showSimplifiedHomepage: false, showThemeV2: false },
+        appearance: { __typename: 'CorpUserAppearanceSettings', showSimplifiedHomepage: false },
         views: { __typename: 'CorpUserViewSettings', defaultView: null },
         homePage: null,
     },
@@ -230,7 +231,7 @@ export const dataPlatformInstance = {
         urn: 'urn:li:dataPlatform:clickhouse',
         properties: {
             displayName: 'ClickHouse',
-            logoUrl: '/assets/platforms/clickhouselogo.png',
+            logoUrl: 'assets/platforms/clickhouselogo.png',
         },
     },
 };
@@ -294,6 +295,7 @@ export const dataset1 = {
                 },
                 associatedUrn: 'urn:li:dataset:1',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -301,6 +303,7 @@ export const dataset1 = {
                 },
                 associatedUrn: 'urn:li:dataset:1',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -310,6 +313,13 @@ export const dataset1 = {
     institutionalMemory: {
         elements: [
             {
+                actor: {
+                    ...user1,
+                },
+                author: {
+                    ...user1,
+                },
+                label: 'This only points to Google',
                 url: 'https://www.google.com',
                 description: 'This only points to Google',
                 created: {
@@ -335,7 +345,7 @@ export const dataset1 = {
         },
     ],
     domain: null,
-    application: null,
+    applications: null,
     container: null,
     health: [],
     assertions: null,
@@ -348,6 +358,7 @@ export const dataset1 = {
     structuredProperties: null,
     forms: null,
     activeIncidents: null,
+    settings: null,
 };
 
 export const dataset2 = {
@@ -398,6 +409,7 @@ export const dataset2 = {
                 },
                 associatedUrn: 'urn:li:dataset:2',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -405,6 +417,7 @@ export const dataset2 = {
                 },
                 type: 'DELEGATE',
                 associatedUrn: 'urn:li:dataset:2',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -432,7 +445,7 @@ export const dataset2 = {
         },
     ],
     domain: null,
-    application: null,
+    applications: null,
     container: null,
     health: [],
     assertions: null,
@@ -446,6 +459,7 @@ export const dataset2 = {
     structuredProperties: null,
     forms: null,
     activeIncidents: null,
+    settings: null,
 };
 
 export const dataset3 = {
@@ -526,6 +540,7 @@ export const dataset3 = {
                 type: 'DATAOWNER',
                 associatedUrn: 'urn:li:dataset:3',
                 ownershipType: null,
+                attribution: null,
             },
             {
                 __typename: 'Owner',
@@ -535,6 +550,7 @@ export const dataset3 = {
                 type: 'DELEGATE',
                 associatedUrn: 'urn:li:dataset:3',
                 ownershipType: null,
+                attribution: null,
             },
         ],
         lastModified: {
@@ -562,6 +578,7 @@ export const dataset3 = {
                     },
                 },
                 associatedUrn: 'urn:li:dataset:3',
+                attribution: null,
             },
         ],
     },
@@ -587,6 +604,7 @@ export const dataset3 = {
                     ownership: null,
                     parentNodes: null,
                 },
+                attribution: null,
                 associatedUrn: 'urn:li:dataset:3',
                 actor: {
                     __typename: 'CorpUser',
@@ -610,12 +628,16 @@ export const dataset3 = {
                     urn: 'urn:li:corpuser:datahub',
                     username: 'datahub',
                     type: EntityType.CorpUser,
+                    properties: null,
+                    info: null,
                 },
                 actor: {
                     __typename: 'CorpUser',
                     urn: 'urn:li:corpuser:datahub',
                     username: 'datahub',
                     type: EntityType.CorpUser,
+                    properties: null,
+                    info: null,
                 },
                 description: 'This only points to Google',
                 label: 'This only points to Google',
@@ -625,6 +647,10 @@ export const dataset3 = {
                     time: 1612396473001,
                 },
                 associatedUrn: 'urn:li:dataset:3',
+                settings: {
+                    showInAssetPreview: false,
+                    __typename: 'InstitutionalMemoryMetadataSettings',
+                },
             },
         ],
     },
@@ -674,7 +700,7 @@ export const dataset3 = {
         },
     ],
     domain: null,
-    application: null,
+    applications: null,
     container: null,
     lineage: null,
     relationships: null,
@@ -699,9 +725,10 @@ export const dataset3 = {
     upstream: null,
     downstream: null,
     versionProperties: null,
+    settings: null,
 } as Dataset;
 
-export const dataset3WithSchema = {
+const dataset3WithSchema = {
     dataset: {
         __typename: 'Dataset',
         schemaMetadata: {
@@ -767,7 +794,7 @@ export const dataset3WithSchema = {
     },
 };
 
-export const dataset4 = {
+const dataset4 = {
     ...dataset3,
     name: 'Fourth Test Dataset',
     urn: 'urn:li:dataset:4',
@@ -780,7 +807,7 @@ export const dataset4 = {
     },
 };
 
-export const dataset5 = {
+const dataset5 = {
     ...dataset3,
     name: 'Fifth Test Dataset',
     urn: 'urn:li:dataset:5',
@@ -794,7 +821,7 @@ export const dataset5 = {
     },
 };
 
-export const dataset6 = {
+const dataset6 = {
     ...dataset3,
     name: 'Sixth Test Dataset',
     urn: 'urn:li:dataset:6',
@@ -806,228 +833,6 @@ export const dataset6 = {
         customProperties: [{ key: 'propertyAKey', value: 'propertyAValue', associatedUrn: 'urn:li:dataset:6' }],
         externalUrl: 'https://data.hub',
         lastModified: dataset3.properties?.lastModified,
-    },
-};
-
-export const dataset7 = {
-    ...dataset3,
-    name: 'Seventh Test Dataset',
-    urn: 'urn:li:dataset:7',
-    properties: {
-        name: 'Seventh Test Dataset',
-        description: 'This and here we have yet another Dataset (YAN). Are there more?',
-        origin: 'PROD',
-        customProperties: [{ key: 'propertyAKey', value: 'propertyAValue' }],
-        externalUrl: 'https://data.hub',
-    },
-};
-
-export const dataset3WithLineage = {
-    ...dataset3,
-    upstream: {
-        start: 0,
-        count: 2,
-        total: 2,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset7,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset4,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 0,
-        total: 0,
-        relationships: [],
-    },
-};
-
-export const dataset4WithLineage = {
-    ...dataset4,
-    upstream: {
-        start: 0,
-        count: 2,
-        total: 2,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset6,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset5,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset3,
-            },
-        ],
-    },
-};
-
-export const dataset5WithCyclicalLineage = {
-    ...dataset5,
-    upstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset3,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset7,
-            },
-        ],
-    },
-};
-
-export const dataset5WithLineage = {
-    ...dataset5,
-    upstream: null,
-    downstream: {
-        start: 0,
-        count: 3,
-        total: 3,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset7,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset6,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset4,
-            },
-        ],
-    },
-};
-
-export const dataset6WithLineage = {
-    ...dataset6,
-    upstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset5,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset4,
-            },
-        ],
-    },
-};
-
-export const dataset7WithLineage = {
-    ...dataset7,
-    upstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset5,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 1,
-        total: 1,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset3,
-            },
-        ],
-    },
-};
-
-export const dataset7WithSelfReferentialLineage = {
-    ...dataset7,
-    upstream: {
-        start: 0,
-        count: 2,
-        total: 2,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset5,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Outgoing,
-                entity: dataset7,
-            },
-        ],
-    },
-    downstream: {
-        start: 0,
-        count: 2,
-        total: 2,
-        relationships: [
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset3,
-            },
-            {
-                type: 'DownstreamOf',
-                direction: RelationshipDirection.Incoming,
-                entity: dataset7,
-            },
-        ],
     },
 };
 
@@ -1074,6 +879,7 @@ export const glossaryTerm1 = {
                 },
                 associatedUrn: 'urn:li:glossaryTerm:1',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -1081,6 +887,7 @@ export const glossaryTerm1 = {
                 },
                 associatedUrn: 'urn:li:glossaryTerm:1',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1183,7 +990,7 @@ const glossaryTerm2 = {
     __typename: 'GlossaryTerm',
 };
 
-export const glossaryTerm3 = {
+const glossaryTerm3 = {
     urn: 'urn:li:glossaryTerm:example.glossaryterm2',
     type: 'GLOSSARY_TERM',
     name: 'glossaryterm2',
@@ -1302,19 +1109,6 @@ export const glossaryNode4 = {
     __typename: 'GlossaryNode',
 } as GlossaryNode;
 
-export const glossaryNode5 = {
-    urn: 'urn:li:glossaryNode:example.glossarynode5',
-    type: 'GLOSSARY_NODE',
-    properties: {
-        name: 'Glossary Node 5',
-    },
-    parentNodes: {
-        count: 1,
-        nodes: [glossaryNode4],
-    },
-    __typename: 'GlossaryNode',
-} as GlossaryNode;
-
 export const sampleTag = {
     urn: 'urn:li:tag:abc-sample-tag',
     type: EntityType.Tag,
@@ -1344,10 +1138,11 @@ export const sampleTag = {
         description: 'sample tag description',
         colorHex: 'sample tag color',
     },
+    deprecation: null,
     autoRenderAspects: [],
 };
 
-export const dataFlow1 = {
+const dataFlow1 = {
     __typename: 'DataFlow',
     urn: 'urn:li:dataFlow:1',
     type: EntityType.DataFlow,
@@ -1372,6 +1167,7 @@ export const dataFlow1 = {
                 },
                 type: 'DATAOWNER',
                 associatedUrn: 'urn:li:dataFlow:1',
+                attribution: null,
             },
             {
                 owner: {
@@ -1379,6 +1175,7 @@ export const dataFlow1 = {
                 },
                 type: 'DELEGATE',
                 associatedUrn: 'urn:li:dataFlow:1',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1400,6 +1197,7 @@ export const dataFlow1 = {
                     },
                 },
                 associatedUrn: 'urn:li:dataFlow:1',
+                attribution: null,
             },
         ],
     },
@@ -1415,7 +1213,7 @@ export const dataFlow1 = {
         },
     },
     domain: null,
-    application: null,
+    applications: null,
     deprecation: null,
     autoRenderAspects: [],
     activeIncidents: null,
@@ -1439,6 +1237,7 @@ export const dataJob1 = {
                 },
                 associatedUrn: 'urn:li:dataJob:1',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -1446,6 +1245,7 @@ export const dataJob1 = {
                 },
                 associatedUrn: 'urn:li:dataJob:1',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1483,6 +1283,7 @@ export const dataJob1 = {
                     },
                 },
                 associatedUrn: 'urn:li:dataJob:1',
+                attribution: null,
             },
         ],
     },
@@ -1503,109 +1304,13 @@ export const dataJob1 = {
         ],
     },
     domain: null,
-    application: null,
+    applications: null,
     status: null,
     deprecation: null,
     autoRenderAspects: [],
     activeIncidents: null,
     health: [],
 } as DataJob;
-
-export const businessAttribute = {
-    urn: 'urn:li:businessAttribute:ba1',
-    type: EntityType.BusinessAttribute,
-    __typename: 'BusinessAttribute',
-    properties: {
-        name: 'TestBusinessAtt-2',
-        description: 'lorem upsum updated 12',
-        created: {
-            time: 1705857132786,
-        },
-        lastModified: {
-            time: 1705857132786,
-        },
-        glossaryTerms: {
-            terms: [
-                {
-                    term: {
-                        urn: 'urn:li:glossaryTerm:1',
-                        type: EntityType.GlossaryTerm,
-                        hierarchicalName: 'SampleHierarchicalName',
-                        name: 'SampleName',
-                    },
-                    associatedUrn: 'urn:li:businessAttribute:ba1',
-                },
-            ],
-            __typename: 'GlossaryTerms',
-        },
-        tags: {
-            __typename: 'GlobalTags',
-            tags: [
-                {
-                    tag: {
-                        urn: 'urn:li:tag:abc-sample-tag',
-                        __typename: 'Tag',
-                        type: EntityType.Tag,
-                        name: 'abc-sample-tag',
-                    },
-                    __typename: 'TagAssociation',
-                    associatedUrn: 'urn:li:businessAttribute:ba1',
-                },
-                {
-                    tag: {
-                        urn: 'urn:li:tag:TestTag',
-                        __typename: 'Tag',
-                        type: EntityType.Tag,
-                        name: 'TestTag',
-                    },
-                    __typename: 'TagAssociation',
-                    associatedUrn: 'urn:li:businessAttribute:ba1',
-                },
-            ],
-        },
-        customProperties: [
-            {
-                key: 'prop2',
-                value: 'val2',
-                associatedUrn: 'urn:li:businessAttribute:ba1',
-                __typename: 'CustomPropertiesEntry',
-            },
-            {
-                key: 'prop1',
-                value: 'val1',
-                associatedUrn: 'urn:li:businessAttribute:ba1',
-                __typename: 'CustomPropertiesEntry',
-            },
-            {
-                key: 'prop3',
-                value: 'val3',
-                associatedUrn: 'urn:li:businessAttribute:ba1',
-                __typename: 'CustomPropertiesEntry',
-            },
-        ],
-    },
-    ownership: {
-        owners: [
-            {
-                owner: {
-                    ...user1,
-                },
-                associatedUrn: 'urn:li:businessAttribute:ba',
-                type: 'DATAOWNER',
-            },
-            {
-                owner: {
-                    ...user2,
-                },
-                associatedUrn: 'urn:li:businessAttribute:ba',
-                type: 'DELEGATE',
-            },
-        ],
-        lastModified: {
-            time: 0,
-        },
-    },
-} as BusinessAttribute;
 
 export const dataJob2 = {
     __typename: 'DataJob',
@@ -1625,6 +1330,7 @@ export const dataJob2 = {
                 },
                 associatedUrn: 'urn:li:dataJob:2',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -1632,6 +1338,7 @@ export const dataJob2 = {
                 },
                 associatedUrn: 'urn:li:dataJob:2',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1666,11 +1373,12 @@ export const dataJob2 = {
                     },
                 },
                 associatedUrn: 'urn:li:dataJob:2',
+                attribution: null,
             },
         ],
     },
     domain: null,
-    application: null,
+    applications: null,
     upstream: null,
     downstream: null,
     deprecation: null,
@@ -1699,6 +1407,7 @@ export const dataJob3 = {
                 },
                 associatedUrn: 'urn:li:dataJob:3',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -1706,6 +1415,7 @@ export const dataJob3 = {
                 },
                 associatedUrn: 'urn:li:dataJob:3',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1740,11 +1450,12 @@ export const dataJob3 = {
                     },
                 },
                 associatedUrn: 'urn:li:dataJob:3',
+                attribution: null,
             },
         ],
     },
     domain: null,
-    application: null,
+    applications: null,
     upstream: null,
     downstream: null,
     status: null,
@@ -1754,7 +1465,7 @@ export const dataJob3 = {
     health: [],
 } as DataJob;
 
-export const mlModel = {
+const mlModel = {
     __typename: 'MLModel',
     urn: 'urn:li:mlModel:(urn:li:dataPlatform:sagemaker,trustmodel,PROD)',
     type: EntityType.Mlmodel,
@@ -1795,6 +1506,7 @@ export const mlModel = {
                 },
                 type: 'DATAOWNER',
                 associatedUrn: 'urn:li:mlModel:(urn:li:dataPlatform:sagemaker,trustmodel,PROD)',
+                attribution: null,
             },
             {
                 owner: {
@@ -1802,6 +1514,7 @@ export const mlModel = {
                 },
                 type: 'DELEGATE',
                 associatedUrn: 'urn:li:mlModel:(urn:li:dataPlatform:sagemaker,trustmodel,PROD)',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1825,6 +1538,7 @@ export const mlModel = {
                     },
                 },
                 associatedUrn: 'urn:li:mlModel:(urn:li:dataPlatform:sagemaker,trustmodel,PROD)',
+                attribution: null,
             },
         ],
     },
@@ -1837,29 +1551,7 @@ export const mlModel = {
     autoRenderAspects: [],
 } as MlModel;
 
-export const dataset1FetchedEntity = {
-    urn: dataset1.urn,
-    name: dataset1.name,
-    type: dataset1.type,
-    upstreamChildren: [],
-    downstreamChildren: [
-        { type: EntityType.Dataset, entity: dataset2 },
-        { type: EntityType.DataJob, entity: dataJob1 },
-    ],
-} as FetchedEntity;
-
-export const dataset2FetchedEntity = {
-    urn: dataset2.urn,
-    name: 'test name',
-    type: dataset2.type,
-    upstreamChildren: [
-        { type: EntityType.Dataset, entity: dataset1 },
-        { type: EntityType.DataJob, entity: dataJob1 },
-    ],
-    downstreamChildren: [],
-} as FetchedEntity;
-
-export const mlModelGroup = {
+const mlModelGroup = {
     __typename: 'MLModelGroup',
     urn: 'urn:li:mlModelGroup:(urn:li:dataPlatform:sagemaker,another-group,PROD)',
     type: EntityType.MlmodelGroup,
@@ -1885,6 +1577,7 @@ export const mlModelGroup = {
                 },
                 associatedUrn: 'urn:li:mlModelGroup:(urn:li:dataPlatform:sagemaker,another-group,PROD)',
                 type: 'DATAOWNER',
+                attribution: null,
             },
             {
                 owner: {
@@ -1892,6 +1585,7 @@ export const mlModelGroup = {
                 },
                 associatedUrn: 'urn:li:mlModelGroup:(urn:li:dataPlatform:sagemaker,another-group,PROD)',
                 type: 'DELEGATE',
+                attribution: null,
             },
         ],
         lastModified: {
@@ -1914,6 +1608,7 @@ export const mlModelGroup = {
                         colorHex: 'sample tag color',
                     },
                 },
+                attribution: null,
             },
         ],
     },
@@ -1925,7 +1620,7 @@ export const mlModelGroup = {
     deprecation: null,
 } as MlModelGroup;
 
-export const recommendationModules = [
+const recommendationModules = [
     {
         title: 'Most Popular',
         moduleId: 'MostPopular',
@@ -1980,7 +1675,7 @@ export const recommendationModules = [
 ];
 
 /*
-    Define mock data to be returned by Apollo MockProvider. 
+    Define mock data to be returned by Apollo MockProvider.
 */
 export const mocks = [
     {
@@ -3724,6 +3419,7 @@ export const mocks = [
                         viewManageTags: true,
                         createDomains: true,
                         createTags: true,
+                        createLogicalModels: true,
                         manageUserCredentials: true,
                         manageGlossaries: true,
                         viewTests: false,
@@ -3733,6 +3429,7 @@ export const mocks = [
                         manageIngestion: true,
                         generatePersonalAccessTokens: true,
                         manageGlobalViews: true,
+                        manageGlobalSettings: true,
                         manageOwnershipTypes: true,
                         manageGlobalAnnouncements: true,
                         createBusinessAttributes: true,
@@ -3741,6 +3438,8 @@ export const mocks = [
                         viewStructuredPropertiesPage: true,
                         manageApplications: true,
                         manageFeatures: true,
+                        manageHomePageTemplates: true,
+                        manageDocuments: true,
                     },
                 },
             },
@@ -4005,6 +3704,7 @@ export const platformPrivileges: PlatformPrivileges = {
     viewAnalytics: true,
     managePolicies: true,
     manageIdentities: true,
+    manageServiceAccounts: true,
     generatePersonalAccessTokens: true,
     manageDomains: true,
     manageIngestion: true,
@@ -4018,15 +3718,19 @@ export const platformPrivileges: PlatformPrivileges = {
     viewManageTags: true,
     createTags: true,
     createDomains: true,
+    createLogicalModels: true,
     manageGlobalViews: true,
+    manageGlobalSettings: true,
     manageOwnershipTypes: true,
     manageGlobalAnnouncements: true,
     createBusinessAttributes: true,
     manageBusinessAttributes: true,
+    manageDocuments: true,
     manageStructuredProperties: true,
     viewStructuredPropertiesPage: true,
     manageApplications: true,
     manageFeatures: true,
+    manageHomePageTemplates: true,
 };
 
 export const DomainMock1 = {
@@ -4064,7 +3768,7 @@ export const DomainMock1 = {
     supportedCapabilities: () => new Set(),
 } as Entity<any>;
 
-export const DomainMock2 = {
+const DomainMock2 = {
     urn: 'urn:li:domain:bebdad41-c523-469f-9b62-de94f938f603',
     id: 'bebdad41-c523-469f-9b62-de94f938f603',
     type: 'DOMAIN',
@@ -4172,6 +3876,7 @@ export const globalTags: GlobalTags = {
                 },
             },
             associatedUrn: 'urn:li:corpuser:1',
+            attribution: null,
         },
     ],
 };

@@ -10,6 +10,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
 import com.datahub.authentication.Actor;
@@ -17,14 +18,22 @@ import com.datahub.authentication.ActorType;
 import com.datahub.authentication.Authentication;
 import com.datahub.event.hook.PlatformEventHook;
 import com.linkedin.metadata.EventUtils;
+import com.linkedin.metadata.kafka.InboundMetadataEnvelope;
+import com.linkedin.metadata.kafka.context.inbound.InboundContextResolver;
+import com.linkedin.metadata.queue.PgQueuePayloadCompression;
+import com.linkedin.metadata.queue.QueueMessageHandle;
+import com.linkedin.metadata.queue.QueueReceivedMessage;
 import com.linkedin.metadata.utils.metrics.MetricUtils;
 import com.linkedin.mxe.PlatformEvent;
 import io.datahubproject.metadata.context.OperationContext;
 import io.datahubproject.test.metadata.context.TestOperationContexts;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.mockito.ArgumentCaptor;
@@ -36,6 +45,7 @@ import org.testng.annotations.Test;
 public class PlatformEventProcessorTest {
 
   private OperationContext mockOperationContext;
+  private InboundContextResolver mockInboundContextResolver;
   private MetricUtils mockMetricUtils;
   private PlatformEventHook mockHook1;
   private PlatformEventHook mockHook2;
@@ -58,7 +68,14 @@ public class PlatformEventProcessorTest {
 
     // Create mock MetricUtils
     mockMetricUtils = mock(MetricUtils.class);
+    when(mockMetricUtils.getRegistry()).thenReturn(new SimpleMeterRegistry());
     when(mockOperationContext.getMetricUtils()).thenReturn(Optional.of(mockMetricUtils));
+
+    // Pass-through inbound resolver — returns the base context unchanged, matching the OSS no-op.
+    mockInboundContextResolver = mock(InboundContextResolver.class);
+    when(mockInboundContextResolver.resolve(
+            any(InboundMetadataEnvelope.class), any(OperationContext.class)))
+        .thenAnswer(invocation -> invocation.getArgument(1));
 
     // Create mock hooks
     mockHook1 = mock(PlatformEventHook.class);
@@ -84,29 +101,46 @@ public class PlatformEventProcessorTest {
     when(mockConsumerRecord.offset()).thenReturn(100L);
     when(mockConsumerRecord.timestamp()).thenReturn(1234567890L);
     when(mockConsumerRecord.serializedValueSize()).thenReturn(1024);
+
+    processor =
+        new PlatformEventProcessor(
+            mockOperationContext, mockInboundContextResolver, Arrays.asList(mockHook1, mockHook2));
   }
 
   @Test
   public void testConstructorFiltersEnabledHooks() {
+    // Create fresh mocks for this test to avoid counting init() calls from setup()
+    PlatformEventHook testHook1 = mock(PlatformEventHook.class);
+    when(testHook1.isEnabled()).thenReturn(true);
+
+    PlatformEventHook testHook2 = mock(PlatformEventHook.class);
+    when(testHook2.isEnabled()).thenReturn(true);
+
+    PlatformEventHook testDisabledHook = mock(PlatformEventHook.class);
+    when(testDisabledHook.isEnabled()).thenReturn(false);
+
     // Create processor with mixed enabled/disabled hooks
-    List<PlatformEventHook> allHooks = Arrays.asList(mockHook1, mockDisabledHook, mockHook2);
-    processor = new PlatformEventProcessor(mockOperationContext, allHooks);
+    List<PlatformEventHook> allHooks = Arrays.asList(testHook1, testDisabledHook, testHook2);
+    PlatformEventProcessor testProcessor =
+        new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, allHooks);
 
     // Verify only enabled hooks are kept
-    assertEquals(processor.getHooks().size(), 2);
-    assertTrue(processor.getHooks().contains(mockHook1));
-    assertTrue(processor.getHooks().contains(mockHook2));
-    assertTrue(!processor.getHooks().contains(mockDisabledHook));
+    assertEquals(testProcessor.getHooks().size(), 2);
+    assertTrue(testProcessor.getHooks().contains(testHook1));
+    assertTrue(testProcessor.getHooks().contains(testHook2));
+    assertTrue(!testProcessor.getHooks().contains(testDisabledHook));
 
     // Verify init is called only on enabled hooks
-    verify(mockHook1, times(1)).init();
-    verify(mockHook2, times(1)).init();
-    verify(mockDisabledHook, never()).init();
+    verify(testHook1, times(1)).init();
+    verify(testHook2, times(1)).init();
+    verify(testDisabledHook, never()).init();
   }
 
   @Test
   public void testConstructorWithNoHooks() {
-    processor = new PlatformEventProcessor(mockOperationContext, Collections.emptyList());
+    processor =
+        new PlatformEventProcessor(
+            mockOperationContext, mockInboundContextResolver, Collections.emptyList());
     assertEquals(processor.getHooks().size(), 0);
   }
 
@@ -114,7 +148,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeSuccessful() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1, mockHook2);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
       mockedEventUtils
@@ -142,7 +178,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeWithAvroConversionFailure() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
       mockedEventUtils
@@ -170,7 +208,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeWithHookFailure() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1, mockHook2);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     // Make first hook throw exception
     doThrow(new RuntimeException("Hook 1 failed"))
@@ -205,7 +245,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeWithAllHooksFailing() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1, mockHook2);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     // Make both hooks throw exceptions
     doThrow(new RuntimeException("Hook 1 failed"))
@@ -245,7 +287,7 @@ public class PlatformEventProcessorTest {
     when(mockOperationContext.getMetricUtils()).thenReturn(Optional.empty());
 
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
 
     try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
       mockedEventUtils
@@ -264,7 +306,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeVerifiesKafkaRecordDetails() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     // Set up specific consumer record values
     String expectedKey = "test-key-123";
@@ -306,10 +350,11 @@ public class PlatformEventProcessorTest {
       verify(specificMockRecord, times(1)).topic();
       verify(specificMockRecord, times(1)).partition();
       verify(specificMockRecord, times(1)).offset();
-      verify(specificMockRecord, times(2))
-          .timestamp(); // Called twice: once for lag calculation, once for logging
+      verify(specificMockRecord, times(1)).timestamp();
       verify(specificMockRecord, times(1)).serializedValueSize();
-      verify(specificMockRecord, times(1)).value(); // Called to get the GenericRecord
+      // value() is called twice: once in consume() for the null-payload short-circuit, and once
+      // inside InboundMetadataEnvelope.fromKafka() to populate the envelope payload.
+      verify(specificMockRecord, times(2)).value();
     }
   }
 
@@ -317,7 +362,9 @@ public class PlatformEventProcessorTest {
   public void testMultipleEventsProcessedSequentially() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     PlatformEvent event1 = mock(PlatformEvent.class);
     when(event1.getName()).thenReturn("Event1");
@@ -370,7 +417,9 @@ public class PlatformEventProcessorTest {
   public void testConsumeWithNullGenericRecord() throws Exception {
     // Setup
     List<PlatformEventHook> hooks = Arrays.asList(mockHook1);
-    processor = new PlatformEventProcessor(mockOperationContext, hooks);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
 
     ConsumerRecord<String, GenericRecord> nullValueRecord = mock(ConsumerRecord.class);
     when(nullValueRecord.value()).thenReturn(null);
@@ -395,6 +444,437 @@ public class PlatformEventProcessorTest {
 
       // Verify hook was NOT invoked
       verify(mockHook1, never()).invoke(any(OperationContext.class), any(PlatformEvent.class));
+    }
+  }
+
+  @Test
+  public void testMicrometerKafkaQueueTimeMetric() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set the consumer group ID via reflection
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    // Set timestamp to simulate queue time
+    long messageTimestamp = System.currentTimeMillis() - 3000; // 3 seconds ago
+    when(mockConsumerRecord.timestamp()).thenReturn(messageTimestamp);
+    when(mockConsumerRecord.topic()).thenReturn("PlatformEvent_v1");
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(mockGenericRecord))
+          .thenReturn(mockPlatformEvent);
+
+      // Execute
+      processor.consume(mockConsumerRecord);
+
+      // Verify timer was recorded
+      Timer timer =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v1",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              "generic-platform-event-job-client");
+
+      assertNotNull(timer);
+      assertEquals(timer.count(), 1);
+      assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) >= 2500); // At least 2.5 seconds
+      assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) <= 3500); // At most 3.5 seconds
+
+      // Verify the dropwizard histogram was also called
+      verify(mockMetricUtils)
+          .histogram(eq(PlatformEventProcessor.class), eq("kafkaLag"), anyLong());
+
+      // Verify successful processing
+      verify(mockHook1).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+    }
+  }
+
+  @Test
+  public void testMicrometerKafkaQueueTimeWithDifferentTopics() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(any(GenericRecord.class)))
+          .thenReturn(mockPlatformEvent);
+
+      // Test with first topic
+      long now = System.currentTimeMillis();
+      when(mockConsumerRecord.timestamp()).thenReturn(now - 2000);
+      when(mockConsumerRecord.topic()).thenReturn("PlatformEvent_v1");
+      processor.consume(mockConsumerRecord);
+
+      // Create second consumer record for different topic
+      ConsumerRecord<String, GenericRecord> mockConsumerRecord2 = mock(ConsumerRecord.class);
+      GenericRecord mockGenericRecord2 = mock(GenericRecord.class);
+      when(mockConsumerRecord2.value()).thenReturn(mockGenericRecord2);
+      when(mockConsumerRecord2.key()).thenReturn("test-key-2");
+      when(mockConsumerRecord2.topic()).thenReturn("PlatformEvent_v2");
+      when(mockConsumerRecord2.partition()).thenReturn(0);
+      when(mockConsumerRecord2.offset()).thenReturn(101L);
+      when(mockConsumerRecord2.timestamp()).thenReturn(now - 5000);
+      when(mockConsumerRecord2.serializedValueSize()).thenReturn(1024);
+
+      // Test with second topic
+      processor.consume(mockConsumerRecord2);
+
+      // Verify separate timers for different topics
+      Timer timer1 =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v1",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              "generic-platform-event-job-client");
+
+      Timer timer2 =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v2",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              "generic-platform-event-job-client");
+
+      assertEquals(timer1.count(), 1);
+      assertEquals(timer2.count(), 1);
+
+      // Verify different queue times
+      assertTrue(timer1.totalTime(TimeUnit.MILLISECONDS) >= 1500);
+      assertTrue(timer1.totalTime(TimeUnit.MILLISECONDS) <= 2500);
+
+      assertTrue(timer2.totalTime(TimeUnit.MILLISECONDS) >= 4500);
+      assertTrue(timer2.totalTime(TimeUnit.MILLISECONDS) <= 5500);
+    }
+  }
+
+  @Test
+  public void testMicrometerMetricsWithProcessingFailure() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    // Make hook throw exception
+    doThrow(new RuntimeException("Hook failed"))
+        .when(mockHook1)
+        .invoke(any(OperationContext.class), any(PlatformEvent.class));
+
+    // Set timestamp
+    long messageTimestamp = System.currentTimeMillis() - 4000; // 4 seconds ago
+    when(mockConsumerRecord.timestamp()).thenReturn(messageTimestamp);
+    when(mockConsumerRecord.topic()).thenReturn("PlatformEvent_v1");
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(mockGenericRecord))
+          .thenReturn(mockPlatformEvent);
+
+      // Execute
+      processor.consume(mockConsumerRecord);
+
+      // Verify timer was still recorded despite hook failure
+      Timer timer =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v1",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              "generic-platform-event-job-client");
+
+      assertEquals(timer.count(), 1);
+      assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) >= 3500);
+      assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) <= 4500);
+
+      // Verify hook was invoked (and failed)
+      verify(mockHook1).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+    }
+  }
+
+  @Test
+  public void testMicrometerMetricsAbsentWhenRegistryNotPresent() throws Exception {
+    // Configure the mock metricUtils to return empty Optional (no registry)
+    when(mockMetricUtils.getRegistry()).thenReturn(new SimpleMeterRegistry());
+
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    when(mockConsumerRecord.timestamp()).thenReturn(System.currentTimeMillis() - 1000);
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(mockGenericRecord))
+          .thenReturn(mockPlatformEvent);
+
+      // Execute - should not throw exception
+      processor.consume(mockConsumerRecord);
+
+      // Verify the histogram method was still called (for dropwizard metrics)
+      verify(mockMetricUtils)
+          .histogram(eq(PlatformEventProcessor.class), eq("kafkaLag"), anyLong());
+
+      // Verify processing completed successfully despite no registry
+      verify(mockHook1).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+    }
+  }
+
+  @Test
+  public void testMicrometerKafkaQueueTimeWithCustomConsumerGroup() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set a custom consumer group ID
+    String customConsumerGroup = "custom-platform-event-consumer";
+    setConsumerGroupId(processor, customConsumerGroup);
+
+    when(mockConsumerRecord.timestamp()).thenReturn(System.currentTimeMillis() - 1500);
+    when(mockConsumerRecord.topic()).thenReturn("PlatformEvent_v1");
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(mockGenericRecord))
+          .thenReturn(mockPlatformEvent);
+
+      // Execute
+      processor.consume(mockConsumerRecord);
+
+      // Verify timer was recorded with custom consumer group
+      Timer timer =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v1",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              customConsumerGroup);
+
+      assertNotNull(timer);
+      assertEquals(timer.count(), 1);
+    }
+  }
+
+  @Test
+  public void testMicrometerKafkaQueueTimeAccuracy() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(any(GenericRecord.class)))
+          .thenReturn(mockPlatformEvent);
+
+      // Test multiple queue times
+      long[] queueTimes = {100, 500, 1000, 2000, 5000}; // milliseconds
+
+      for (int i = 0; i < queueTimes.length; i++) {
+        // Create new consumer record for each test
+        ConsumerRecord<String, GenericRecord> testRecord = mock(ConsumerRecord.class);
+        GenericRecord testGenericRecord = mock(GenericRecord.class);
+        when(testRecord.value()).thenReturn(testGenericRecord);
+        when(testRecord.key()).thenReturn("test-key-" + i);
+        when(testRecord.topic()).thenReturn("PlatformEvent_v1");
+        when(testRecord.partition()).thenReturn(0);
+        when(testRecord.offset()).thenReturn(100L + i);
+        when(testRecord.timestamp()).thenReturn(System.currentTimeMillis() - queueTimes[i]);
+        when(testRecord.serializedValueSize()).thenReturn(1024);
+
+        processor.consume(testRecord);
+      }
+
+      // Verify timer statistics
+      Timer timer =
+          meterRegistry.timer(
+              MetricUtils.MESSAGING_QUEUE_TIME,
+              MetricUtils.MESSAGING_SYSTEM,
+              MetricUtils.MESSAGING_SYSTEM_KAFKA,
+              MetricUtils.MESSAGING_TOPIC,
+              "PlatformEvent_v1",
+              MetricUtils.MESSAGING_CONSUMER_GROUP,
+              "generic-platform-event-job-client");
+
+      assertEquals(timer.count(), queueTimes.length);
+
+      // Verify mean is reasonable (should be around (100+500+1000+2000+5000)/5 = 1720ms)
+      double mean = timer.mean(TimeUnit.MILLISECONDS);
+      assertTrue(mean >= 1500);
+      assertTrue(mean <= 2000);
+
+      // Verify max recorded time
+      assertTrue(timer.max(TimeUnit.MILLISECONDS) >= 4500);
+      assertTrue(timer.max(TimeUnit.MILLISECONDS) <= 5500);
+
+      // Verify histogram was called for each record
+      verify(mockMetricUtils, times(queueTimes.length))
+          .histogram(eq(PlatformEventProcessor.class), eq("kafkaLag"), anyLong());
+    }
+  }
+
+  @Test
+  public void testMicrometerMetricsWithNullRecord() throws Exception {
+    // Setup a real MeterRegistry
+    SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    // Configure the mock metricUtils to return the registry
+    when(mockMetricUtils.getRegistry()).thenReturn(meterRegistry);
+
+    // Set the consumer group ID
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    // Setup null record
+    ConsumerRecord<String, GenericRecord> nullValueRecord = mock(ConsumerRecord.class);
+    when(nullValueRecord.value()).thenReturn(null);
+    when(nullValueRecord.key()).thenReturn("test-key");
+    when(nullValueRecord.topic()).thenReturn("PlatformEvent_v1");
+    when(nullValueRecord.partition()).thenReturn(0);
+    when(nullValueRecord.offset()).thenReturn(100L);
+    when(nullValueRecord.timestamp()).thenReturn(System.currentTimeMillis() - 2000);
+    when(nullValueRecord.serializedValueSize()).thenReturn(0);
+
+    // Execute
+    processor.consume(nullValueRecord);
+
+    // Verify timer was still recorded even for null record
+    Timer timer =
+        meterRegistry.timer(
+            MetricUtils.MESSAGING_QUEUE_TIME,
+            MetricUtils.MESSAGING_SYSTEM,
+            MetricUtils.MESSAGING_SYSTEM_KAFKA,
+            MetricUtils.MESSAGING_TOPIC,
+            "PlatformEvent_v1",
+            MetricUtils.MESSAGING_CONSUMER_GROUP,
+            "generic-platform-event-job-client");
+
+    assertEquals(timer.count(), 1);
+    assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) >= 1500);
+    assertTrue(timer.totalTime(TimeUnit.MILLISECONDS) <= 2500);
+
+    // Verify null record metric was incremented
+    verify(mockMetricUtils).increment(eq(PlatformEventProcessor.class), eq("null_record"), eq(1d));
+
+    // Verify hook was NOT invoked
+    verify(mockHook1, never()).invoke(any(OperationContext.class), any(PlatformEvent.class));
+  }
+
+  @Test
+  public void testConsumePgQueueSuccessful() throws Exception {
+    List<PlatformEventHook> hooks = Arrays.asList(mockHook1, mockHook2);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    GenericRecord pgRecord = mock(GenericRecord.class);
+    long enqueuedAtMillis = System.currentTimeMillis();
+
+    QueueReceivedMessage message = newTestPgQueueMessage(enqueuedAtMillis);
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(pgRecord))
+          .thenReturn(mockPlatformEvent);
+
+      processor.consumeEnvelope(
+          InboundMetadataEnvelope.fromPgQueue(
+              message, "PlatformEvent_v1", "generic-platform-event-job-client", pgRecord));
+
+      verify(mockMetricUtils, times(1))
+          .histogram(eq(PlatformEventProcessor.class), eq("kafkaLag"), anyLong());
+      verify(mockMetricUtils, times(1))
+          .increment(eq(PlatformEventProcessor.class), eq("received_pe_count"), eq(1d));
+      verify(mockMetricUtils, times(1))
+          .increment(eq(PlatformEventProcessor.class), eq("consumed_pe_count"), eq(1d));
+
+      verify(mockHook1, times(1)).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+      verify(mockHook2, times(1)).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+    }
+  }
+
+  @Test
+  public void testConsumePgQueueWithHookFailure() throws Exception {
+    List<PlatformEventHook> hooks = Arrays.asList(mockHook1, mockHook2);
+    processor = new PlatformEventProcessor(mockOperationContext, mockInboundContextResolver, hooks);
+    setConsumerGroupId(processor, "generic-platform-event-job-client");
+
+    doThrow(new RuntimeException("Hook 1 failed"))
+        .when(mockHook1)
+        .invoke(any(OperationContext.class), any(PlatformEvent.class));
+
+    GenericRecord pgRecord = mock(GenericRecord.class);
+    long enqueuedAtMillis = System.currentTimeMillis();
+
+    QueueReceivedMessage message = newTestPgQueueMessage(enqueuedAtMillis);
+
+    try (MockedStatic<EventUtils> mockedEventUtils = Mockito.mockStatic(EventUtils.class)) {
+      mockedEventUtils
+          .when(() -> EventUtils.avroToPegasusPE(pgRecord))
+          .thenReturn(mockPlatformEvent);
+
+      processor.consumeEnvelope(
+          InboundMetadataEnvelope.fromPgQueue(
+              message, "PlatformEvent_v1", "generic-platform-event-job-client", pgRecord));
+
+      verify(mockHook1, times(1)).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+      verify(mockHook2, times(1)).invoke(any(OperationContext.class), eq(mockPlatformEvent));
+
+      verify(mockMetricUtils, times(1))
+          .increment(eq(PlatformEventProcessor.class), eq("consumed_pe_count"), eq(1d));
+    }
+  }
+
+  private static QueueReceivedMessage newTestPgQueueMessage(long enqueuedAtMillis) {
+    QueueMessageHandle handle =
+        new QueueMessageHandle(1L, java.time.Instant.ofEpochMilli(enqueuedAtMillis), 1L, 0, 42L);
+    return new QueueReceivedMessage(
+        handle,
+        1,
+        new byte[0],
+        java.util.Optional.empty(),
+        PgQueuePayloadCompression.NONE,
+        java.util.List.of(),
+        "test-key",
+        "test-owner");
+  }
+
+  // Helper method to set consumer group ID via reflection
+  private void setConsumerGroupId(PlatformEventProcessor processor, String consumerGroupId) {
+    try {
+      java.lang.reflect.Field field =
+          PlatformEventProcessor.class.getDeclaredField("datahubPlatformEventConsumerGroupId");
+      field.setAccessible(true);
+      field.set(processor, consumerGroupId);
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to set datahubPlatformEventConsumerGroupId field", e);
     }
   }
 }

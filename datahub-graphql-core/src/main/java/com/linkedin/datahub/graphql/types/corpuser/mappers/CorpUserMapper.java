@@ -29,6 +29,7 @@ import com.linkedin.entity.EnvelopedAspectMap;
 import com.linkedin.identity.CorpUserCredentials;
 import com.linkedin.identity.CorpUserEditableInfo;
 import com.linkedin.identity.CorpUserInfo;
+import com.linkedin.identity.CorpUserLocaleSettings;
 import com.linkedin.identity.CorpUserSettings;
 import com.linkedin.identity.CorpUserStatus;
 import com.linkedin.metadata.key.CorpUserKey;
@@ -81,9 +82,12 @@ public class CorpUserMapper {
                 CorpUserEditableInfoMapper.map(context, new CorpUserEditableInfo(dataMap))));
     mappingHelper.mapToResult(
         GLOBAL_TAGS_ASPECT_NAME,
-        (corpUser, dataMap) ->
-            corpUser.setGlobalTags(
-                GlobalTagsMapper.map(context, new GlobalTags(dataMap), entityUrn)));
+        (corpUser, dataMap) -> {
+          com.linkedin.datahub.graphql.generated.GlobalTags tags =
+              GlobalTagsMapper.map(context, new GlobalTags(dataMap), entityUrn);
+          corpUser.setGlobalTags(tags);
+          corpUser.setTags(tags);
+        });
     mappingHelper.mapToResult(
         CORP_USER_STATUS_ASPECT_NAME,
         (corpUser, dataMap) ->
@@ -128,6 +132,11 @@ public class CorpUserMapper {
       result.setHomePage(mapCorpUserHomePageSettings(corpUserSettings.getHomePage()));
     }
 
+    // Map Locale Settings.
+    if (corpUserSettings.hasLocale()) {
+      result.setLocale(mapCorpUserLocaleSettings(corpUserSettings.getLocale()));
+    }
+
     corpUser.setSettings(result);
   }
 
@@ -169,9 +178,11 @@ public class CorpUserMapper {
       @Nonnull final com.linkedin.identity.CorpUserHomePageSettings homePageSettings) {
     CorpUserHomePageSettings result = new CorpUserHomePageSettings();
 
-    if (homePageSettings.hasPageTemplate()) {
+    if (homePageSettings.getPageTemplate() != null) {
       result.setPageTemplate(
           (DataHubPageTemplate) UrnToEntityMapper.map(null, homePageSettings.getPageTemplate()));
+    } else {
+      result.setPageTemplate(null);
     }
 
     if (homePageSettings.hasDismissedAnnouncements()) {
@@ -182,6 +193,17 @@ public class CorpUserMapper {
       result.setDismissedAnnouncementUrns(dismissedUrnStrings);
     }
 
+    return result;
+  }
+
+  @Nonnull
+  private com.linkedin.datahub.graphql.generated.CorpUserLocaleSettings mapCorpUserLocaleSettings(
+      @Nonnull final CorpUserLocaleSettings localeSettings) {
+    com.linkedin.datahub.graphql.generated.CorpUserLocaleSettings result =
+        new com.linkedin.datahub.graphql.generated.CorpUserLocaleSettings();
+    if (localeSettings.hasLanguage()) {
+      result.setLanguage(localeSettings.getLanguage());
+    }
     return result;
   }
 

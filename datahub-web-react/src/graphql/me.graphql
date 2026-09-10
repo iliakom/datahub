@@ -1,6 +1,7 @@
 query getMe {
     me {
         corpUser {
+            type
             urn
             username
             info {
@@ -37,9 +38,12 @@ query getMe {
                 }
                 homePage {
                     pageTemplate {
-                        ...pageTemplateFields
+                        ...PageTemplate
                     }
                     dismissedAnnouncementUrns
+                }
+                locale {
+                    language
                 }
             }
         }
@@ -60,7 +64,9 @@ query getMe {
             viewManageTags
             createDomains
             createTags
+            createLogicalModels
             manageGlobalViews
+            manageGlobalSettings
             manageOwnershipTypes
             manageGlobalAnnouncements
             createBusinessAttributes
@@ -69,6 +75,9 @@ query getMe {
             viewStructuredPropertiesPage
             manageApplications
             manageFeatures
+            manageHomePageTemplates
+            manageDocuments
+            manageServiceAccounts
         }
     }
 }

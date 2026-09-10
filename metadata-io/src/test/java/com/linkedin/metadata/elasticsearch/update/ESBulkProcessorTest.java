@@ -6,7 +6,9 @@ import static org.mockito.Mockito.*;
 import static org.testng.Assert.*;
 
 import com.linkedin.metadata.search.elasticsearch.update.ESBulkProcessor;
+import com.linkedin.metadata.utils.elasticsearch.SearchClientShim;
 import com.linkedin.metadata.utils.metrics.MetricUtils;
+import io.datahubproject.metadata.context.OperationContext;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Optional;
@@ -18,8 +20,6 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.client.RequestOptions;
-import org.opensearch.client.RestHighLevelClient;
-import org.opensearch.client.tasks.TaskSubmissionResponse;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
@@ -28,22 +28,47 @@ import org.opensearch.index.reindex.DeleteByQueryRequest;
 import org.opensearch.index.reindex.UpdateByQueryRequest;
 import org.opensearch.script.Script;
 import org.opensearch.script.ScriptType;
+import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 public class ESBulkProcessorTest {
 
-  @Mock private RestHighLevelClient mockSearchClient;
+  @Mock private SearchClientShim<?> mockSearchClient;
   @Mock private MetricUtils mockMetricUtils;
   @Mock private BulkByScrollResponse mockBulkByScrollResponse;
-  @Mock private TaskSubmissionResponse mockTaskSubmissionResponse;
   @Mock private BulkResponse mockBulkResponse;
+  @Mock private OperationContext opContext;
 
   private AutoCloseable mocks;
 
+  private String TEST_TASK_STRING = "nodeid123:1234";
+
   @BeforeMethod
-  public void setup() {
+  public void setup() throws IOException {
     mocks = MockitoAnnotations.openMocks(this);
+    // Stub generateBulkProcessor and generateAsyncBulkProcessor to do nothing
+    // This prevents any real BulkProcessor instances from being created
+    doNothing()
+        .when(mockSearchClient)
+        .generateBulkProcessor(any(), any(), anyInt(), anyLong(), anyLong(), anyInt(), anyInt());
+    doNothing()
+        .when(mockSearchClient)
+        .generateAsyncBulkProcessor(
+            any(), any(), anyInt(), anyLong(), anyLong(), anyInt(), anyInt());
+    doNothing()
+        .when(mockSearchClient)
+        .configureBulkProcessorWriteOptions(any(Boolean.class), anyInt());
+    // Ensure closeBulkProcessor can be called without issues
+    doNothing().when(mockSearchClient).closeBulkProcessor();
+    doNothing().when(mockSearchClient).flushBulkProcessor();
+  }
+
+  @AfterMethod
+  public void tearDown() throws Exception {
+    if (mocks != null) {
+      mocks.close();
+    }
   }
 
   @Test
@@ -78,11 +103,37 @@ public class ESBulkProcessorTest {
   }
 
   @Test
+  public void testFlushAndWaitSuccess() throws Exception {
+    when(mockSearchClient.drainBulkTransferFailures()).thenReturn(0L);
+    ESBulkProcessor processor =
+        ESBulkProcessor.builder(mockSearchClient, mockMetricUtils)
+            .ackAfterTransfer(true)
+            .ackAfterTransferTimeoutSeconds(15)
+            .build();
+
+    processor.flushAndWait(java.time.Duration.ofSeconds(15));
+    verify(mockSearchClient).flushAndAwaitBulkTransfer(15000L);
+    verify(mockSearchClient).drainBulkTransferFailures();
+    assertTrue(processor.isAckAfterTransfer());
+    assertEquals(processor.getAckAfterTransferTimeoutSeconds(), 15);
+  }
+
+  @Test
+  public void testFlushAndWaitThrowsOnTransferFailures() throws Exception {
+    when(mockSearchClient.drainBulkTransferFailures()).thenReturn(3L);
+    ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, mockMetricUtils).build();
+
+    expectThrows(
+        com.linkedin.metadata.search.elasticsearch.update.BulkTransferException.class,
+        () -> processor.flushAndWait(java.time.Duration.ofSeconds(5)));
+  }
+
+  @Test
   public void testAddRequest() {
     ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, mockMetricUtils).build();
 
     IndexRequest indexRequest = new IndexRequest("test-index").id("1");
-    processor.add(indexRequest);
+    processor.add(opContext, "1", indexRequest);
 
     verify(mockMetricUtils, times(1))
         .increment(eq(processor.getClass()), eq("num_elasticSearch_writes"), eq(1d));
@@ -94,7 +145,7 @@ public class ESBulkProcessorTest {
 
     IndexRequest indexRequest = new IndexRequest("test-index").id("1");
     // Should not throw exception even with null metrics
-    processor.add(indexRequest);
+    processor.add(opContext, "1", indexRequest);
   }
 
   @Test
@@ -103,14 +154,17 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(100L);
     when(mockSearchClient.updateByQuery(
-            any(UpdateByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(UpdateByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     Script script =
         new Script(ScriptType.INLINE, "painless", "ctx._source.field = 'value'", Map.of());
     QueryBuilder query = QueryBuilders.matchAllQuery();
 
-    Optional<BulkByScrollResponse> result = processor.updateByQuery(script, query, "test-index");
+    Optional<BulkByScrollResponse> result =
+        processor.updateByQuery(opContext, script, query, "test-index");
 
     assertTrue(result.isPresent());
     assertEquals(result.get(), mockBulkByScrollResponse);
@@ -124,14 +178,17 @@ public class ESBulkProcessorTest {
 
     IOException exception = new IOException("Update failed");
     when(mockSearchClient.updateByQuery(
-            any(UpdateByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(UpdateByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenThrow(exception);
 
     Script script =
         new Script(ScriptType.INLINE, "painless", "ctx._source.field = 'value'", Map.of());
     QueryBuilder query = QueryBuilders.matchAllQuery();
 
-    Optional<BulkByScrollResponse> result = processor.updateByQuery(script, query, "test-index");
+    Optional<BulkByScrollResponse> result =
+        processor.updateByQuery(opContext, script, query, "test-index");
 
     assertFalse(result.isPresent());
     verify(mockMetricUtils, times(1))
@@ -144,7 +201,9 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(100L);
     when(mockSearchClient.updateByQuery(
-            any(UpdateByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(UpdateByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     Script script =
@@ -152,7 +211,8 @@ public class ESBulkProcessorTest {
     QueryBuilder query = QueryBuilders.matchAllQuery();
 
     // Should not throw exception even with null metrics
-    Optional<BulkByScrollResponse> result = processor.updateByQuery(script, query, "test-index");
+    Optional<BulkByScrollResponse> result =
+        processor.updateByQuery(opContext, script, query, "test-index");
 
     assertTrue(result.isPresent());
   }
@@ -163,12 +223,14 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(50L);
     when(mockSearchClient.deleteByQuery(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
-    Optional<BulkByScrollResponse> result = processor.deleteByQuery(query, "test-index");
+    Optional<BulkByScrollResponse> result = processor.deleteByQuery(opContext, query, "test-index");
 
     assertTrue(result.isPresent());
     assertEquals(result.get(), mockBulkByScrollResponse);
@@ -182,12 +244,14 @@ public class ESBulkProcessorTest {
 
     IOException exception = new IOException("Delete failed");
     when(mockSearchClient.deleteByQuery(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenThrow(exception);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
-    Optional<BulkByScrollResponse> result = processor.deleteByQuery(query, "test-index");
+    Optional<BulkByScrollResponse> result = processor.deleteByQuery(opContext, query, "test-index");
 
     assertFalse(result.isPresent());
     verify(mockMetricUtils, times(1))
@@ -200,13 +264,15 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(50L);
     when(mockSearchClient.deleteByQuery(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
     // Should not throw exception even with null metrics
-    Optional<BulkByScrollResponse> result = processor.deleteByQuery(query, "test-index");
+    Optional<BulkByScrollResponse> result = processor.deleteByQuery(opContext, query, "test-index");
 
     assertTrue(result.isPresent());
   }
@@ -222,18 +288,23 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(75L);
     when(mockSearchClient.deleteByQuery(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     QueryBuilder query = QueryBuilders.matchAllQuery();
     TimeValue timeout = TimeValue.timeValueMinutes(10);
 
     Optional<BulkByScrollResponse> result =
-        processor.deleteByQuery(query, false, 200, timeout, "test-index");
+        processor.deleteByQuery(opContext, query, false, 200, timeout, "test-index");
 
     assertTrue(result.isPresent());
     verify(mockSearchClient)
-        .deleteByQuery(any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT));
+        .deleteByQuery(
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT));
   }
 
   @Test
@@ -241,16 +312,18 @@ public class ESBulkProcessorTest {
     ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, mockMetricUtils).build();
 
     when(mockSearchClient.submitDeleteByQueryTask(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
-        .thenReturn(mockTaskSubmissionResponse);
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
+        .thenReturn(TEST_TASK_STRING);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
-    Optional<TaskSubmissionResponse> result =
-        processor.deleteByQueryAsync(query, true, 100, null, "test-index");
+    Optional<String> result =
+        processor.deleteByQueryAsync(opContext, query, true, 100, null, "test-index");
 
     assertTrue(result.isPresent());
-    assertEquals(result.get(), mockTaskSubmissionResponse);
+    assertEquals(result.get(), TEST_TASK_STRING);
     verify(mockMetricUtils, times(1))
         .increment(eq(processor.getClass()), eq("num_elasticSearch_batches_submitted"), eq(1d));
   }
@@ -261,13 +334,15 @@ public class ESBulkProcessorTest {
 
     IOException exception = new IOException("Submit task failed");
     when(mockSearchClient.submitDeleteByQueryTask(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenThrow(exception);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
-    Optional<TaskSubmissionResponse> result =
-        processor.deleteByQueryAsync(query, true, 100, null, "test-index");
+    Optional<String> result =
+        processor.deleteByQueryAsync(opContext, query, true, 100, null, "test-index");
 
     assertFalse(result.isPresent());
     verify(mockMetricUtils, times(1))
@@ -280,14 +355,16 @@ public class ESBulkProcessorTest {
     ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, null).build();
 
     when(mockSearchClient.submitDeleteByQueryTask(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
-        .thenReturn(mockTaskSubmissionResponse);
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
+        .thenReturn(TEST_TASK_STRING);
 
     QueryBuilder query = QueryBuilders.termQuery("status", "deleted");
 
     // Should not throw exception even with null metrics
-    Optional<TaskSubmissionResponse> result =
-        processor.deleteByQueryAsync(query, true, 100, null, "test-index");
+    Optional<String> result =
+        processor.deleteByQueryAsync(opContext, query, true, 100, null, "test-index");
 
     assertTrue(result.isPresent());
   }
@@ -297,18 +374,24 @@ public class ESBulkProcessorTest {
     ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, mockMetricUtils).build();
 
     when(mockSearchClient.submitDeleteByQueryTask(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
-        .thenReturn(mockTaskSubmissionResponse);
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
+        .thenReturn(TEST_TASK_STRING);
 
     QueryBuilder query = QueryBuilders.matchAllQuery();
     TimeValue timeout = TimeValue.timeValueMinutes(30);
 
-    Optional<TaskSubmissionResponse> result =
-        processor.deleteByQueryAsync(query, false, 500, timeout, "test-index-1", "test-index-2");
+    Optional<String> result =
+        processor.deleteByQueryAsync(
+            opContext, query, false, 500, timeout, "test-index-1", "test-index-2");
 
     assertTrue(result.isPresent());
     verify(mockSearchClient)
-        .submitDeleteByQueryTask(any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT));
+        .submitDeleteByQueryTask(
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT));
   }
 
   @Test
@@ -330,9 +413,9 @@ public class ESBulkProcessorTest {
     ESBulkProcessor processor = ESBulkProcessor.builder(mockSearchClient, mockMetricUtils).build();
 
     // Add various types of requests
-    processor.add(new IndexRequest("index1").id("1"));
-    processor.add(new UpdateRequest("index1", "2"));
-    processor.add(new DeleteRequest("index1", "3"));
+    processor.add(opContext, "1", new IndexRequest("index1").id("1"));
+    processor.add(opContext, "2", new UpdateRequest("index1", "2"));
+    processor.add(opContext, "3", new DeleteRequest("index1", "3"));
 
     verify(mockMetricUtils, times(3))
         .increment(eq(processor.getClass()), eq("num_elasticSearch_writes"), eq(1d));
@@ -345,12 +428,14 @@ public class ESBulkProcessorTest {
 
     when(mockBulkByScrollResponse.getTotal()).thenReturn(25L);
     when(mockSearchClient.deleteByQuery(
-            any(DeleteByQueryRequest.class), eq(RequestOptions.DEFAULT)))
+            any(OperationContext.class),
+            any(DeleteByQueryRequest.class),
+            eq(RequestOptions.DEFAULT)))
         .thenReturn(mockBulkByScrollResponse);
 
     QueryBuilder query = QueryBuilders.matchAllQuery();
 
-    Optional<BulkByScrollResponse> result = processor.deleteByQuery(query, "test-index");
+    Optional<BulkByScrollResponse> result = processor.deleteByQuery(opContext, query, "test-index");
 
     assertTrue(result.isPresent());
     // With batchDelete=true, flush should not be called before delete

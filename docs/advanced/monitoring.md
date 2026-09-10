@@ -1,3 +1,7 @@
+---
+description: "Monitor DataHub services with Prometheus, OpenTelemetry, and JMX metrics for production observability and alerting."
+---
+
 # Monitoring DataHub
 
 ## Overview
@@ -33,6 +37,12 @@ DataHub's observability strategy consists of two complementary approaches:
    - Resource Metrics: CPU, memory utilization
    - Application Metrics: Cache hit rates, queue depths, processing times
    - Business Metrics: Entity counts, ingestion rates, search performance
+
+### GMS HTTP service rate limiting metrics
+
+When [GMS HTTP service rate limiting](../deploy/gms-rate-limiting.md) is active (`capacity.enabled` and/or `endpoint.enabled`), scrape `gms.rate_limit.requests`, `gms.rate_limit.adaptive.limit`, and `gms.rate_limit.endpoint.remaining` to alert on sustained denials or exhausted auth-path buckets. Adaptive capacity metrics are tagged by `rule_id` — each tag is an independent in-flight pool; sum inflight across rules to estimate total pod load. Use `GET /openapi/v1/rate-limits/status` for live per-pod state (`capacityEnabled`, `endpointEnabled`, per-rule adaptive/endpoint maps) during incidents.
+
+These metrics are **not** MCP ingestion throttle or Kafka lag backpressure — for pipeline-side 429s and consumer lag, use MCP throttle settings (`MCP_*` env vars) and `/openapi/operations/throttle/*` instead.
 
 2. Distributed Tracing
 
@@ -409,6 +419,329 @@ histogram_quantile(0.99,
 rate(graphql_request_errors_total[5m])
 ```
 
+## Kafka Consumer Instrumentation (Micrometer)
+
+### Overview
+
+DataHub provides comprehensive instrumentation for Kafka message consumption through Micrometer metrics, enabling
+real-time monitoring of message queue latency and consumer performance. This instrumentation is critical for
+maintaining data freshness SLAs and identifying processing bottlenecks across DataHub's event-driven architecture.
+
+### Why Kafka Queue Time Monitoring Matters
+
+Traditional Kafka lag monitoring only tells you "we're behind by 10,000 messages"
+Without queue time metrics, you can't answer critical questions like "are we meeting our 5-minute data freshness SLA?"
+or "which consumer groups are experiencing delays?"
+
+#### Real-World Impact
+
+Consider these scenarios:
+
+Variable Production Rate:
+
+- Morning: 100 messages/second → 1000 message lag = 10 seconds old
+- Evening: 10 messages/second → 1000 message lag = 100 seconds old
+- Same lag count, vastly different business impact!
+
+Burst Traffic Patterns:
+
+- Bulk ingestion creates 1M message backlog
+- Are these messages from the last hour (recoverable) or last 24 hours (SLA breach)?
+
+Consumer Group Performance:
+
+- Real-time processors need < 1 minute latency
+- Analytics consumers can tolerate 1 hour latency
+- Different groups require different monitoring thresholds
+
+### Architecture
+
+Kafka queue time instrumentation is implemented across all DataHub consumers:
+
+- MetadataChangeProposals (MCP) Processor - SQL entity updates
+  - BatchMetadataChangeProposals (MCP) Processor - Bulk SQL entity updates
+- MetadataChangeLog (MCL) Processor & Hooks - Elasticsearch & downstream aspect operations
+- DataHubUsageEventsProcessor - Usage analytics events
+- PlatformEventProcessor - Platform operations & external consumers
+
+Each consumer automatically records queue time metrics using the message's embedded timestamp.
+
+### Metrics Collected
+
+#### Core Metric
+
+Metric: `messaging.queue.time`
+
+- Type: Timer with percentile histogram and configurable SLO buckets (use `histogram_quantile()` or SLO bucket rates for alerting — client-side `quantile` gauges are not exported)
+- Unit: Milliseconds
+- Tags:
+  - `messaging.system`: `kafka` or `pgqueue`
+  - `topic`: Logical topic name (e.g., `MetadataChangeProposal_v1`)
+  - `consumer.group`: Consumer group ID (e.g., `generic-mce-consumer`)
+  - `messaging.priority`: pgQueue WFQ band index only (omitted for Kafka)
+- Use Case: Monitor end-to-end latency from message production to consumer processing
+
+#### Statistical Distribution
+
+The timer automatically tracks:
+
+- Count: Total messages processed
+- Sum: Cumulative queue time
+- Max: Highest queue time observed
+- Histogram buckets: `_bucket` series for percentile estimates via `histogram_quantile()` and SLO compliance
+- SLO Buckets: Percentage of messages meeting latency targets
+
+#### Configuration Guide
+
+Default Configuration:
+
+```yaml
+kafka:
+  consumer:
+    metrics:
+      # Service Level Objective buckets (seconds)
+      slo: "300,1800,3600,10800,21600,43200" # 5m,30m,1h,3h,6h,12h
+
+      # Maximum expected queue time
+      maxExpectedValue: 86400 # 24 hours (seconds)
+```
+
+#### Key Monitoring Patterns
+
+SLA Compliance Monitoring:
+
+```promql
+# Percentage of Kafka messages processed within 5-minute SLA
+sum(rate(messaging_queue_time_seconds_bucket{le="300", messaging_system="kafka"}[5m])) by (topic)
+/ sum(rate(messaging_queue_time_seconds_count{messaging_system="kafka"}[5m])) by (topic) * 100
+```
+
+Consumer Group Comparison:
+
+```promql
+# P99 queue time by consumer group (Kafka)
+histogram_quantile(0.99,
+  sum by (consumer_group, le) (
+    rate(messaging_queue_time_seconds_bucket{messaging_system="kafka"}[5m])
+  )
+)
+```
+
+pgQueue priority bands:
+
+```promql
+histogram_quantile(0.99,
+  sum by (topic, messaging_priority, le) (
+    rate(messaging_queue_time_seconds_bucket{messaging_system="pgqueue"}[5m])
+  )
+)
+```
+
+#### Performance Considerations
+
+Metric Cardinality:
+
+The instrumentation is designed for low cardinality:
+
+- Kafka: `messaging.system`, `topic`, `consumer.group`
+- pgQueue: adds `messaging.priority` (bounded WFQ band count)
+- No partition-level tags (avoiding explosion with high partition counts)
+- No message-specific tags
+
+Overhead Assessment:
+
+- CPU Impact: Minimal - single timestamp calculation per message
+- Memory Impact: ~5KB per topic/consumer-group combination
+- Network Impact: Negligible - metrics aggregated before export
+
+#### Migration from Legacy Metrics
+
+Micrometer queue time metrics coexist with the legacy DropWizard `kafkaLag` histogram (name unchanged for JMX/Grafana compatibility):
+
+- Legacy (JMX): class-scoped `kafkaLag` histogram — still emitted for Kafka and pgQueue consumers
+- Micrometer: `messaging.queue.time` timer with `messaging.system` and related tags
+- The deprecated Micrometer name `kafka.message.queue.time` is no longer emitted
+
+The new metrics provide:
+
+- Histogram-based percentile estimates (`histogram_quantile()` over `_bucket` series)
+- SLO bucket tracking
+- Multi-backend support
+- Dimensional tagging
+
+## DataHub Request Hook Latency Instrumentation (Micrometer)
+
+### Overview
+
+DataHub provides comprehensive instrumentation for measuring the latency from initial request submission to post-MCL
+(Metadata Change Log) hook execution. This metric is crucial for understanding the end-to-end processing time of metadata
+changes, including both the time spent in Kafka queues and the time taken to process through the system to the final hooks.
+
+### Why Hook Latency Monitoring Matters
+
+Traditional metrics only show individual component performance. Request hook latency provides the complete picture of how long
+it takes for a metadata change to be fully processed through DataHub's pipeline:
+
+- Request Submission: When a metadata change request is initially submitted
+- Queue Time: Time spent in Kafka topics waiting to be consumed
+- Processing Time: Time for the change to be persisted and processed
+- Hook Execution: Final execution of MCL hooks
+
+This end-to-end view is essential for:
+
+- Meeting data freshness SLAs
+- Identifying bottlenecks in the metadata pipeline
+- Understanding the impact of system load on processing times
+- Ensuring timely updates to downstream systems
+
+### Configuration
+
+Hook latency metrics are configured separately from Kafka consumer metrics to allow fine-tuning based on your specific requirements:
+
+```yaml
+datahub:
+  metrics:
+    # Measures the time from request to post-MCL hook execution
+    hookLatency:
+      # Percentiles to calculate for latency distribution
+      percentiles: "0.5,0.95,0.99,0.999"
+
+      # Service Level Objective buckets (seconds)
+      # These define the latency targets you want to track
+      slo: "300,1800,3000,10800,21600,43200" # 5m, 30m, 1h, 3h, 6h, 12h
+
+      # Maximum expected latency (seconds)
+      # Values above this are considered outliers
+      maxExpectedValue: 86000 # 24 hours
+```
+
+### Metrics Collected
+
+#### Core Metric
+
+Metric: `datahub.request.hook.queue.time`
+
+- Type: Timer with configurable percentiles and SLO buckets
+- Unit: Milliseconds
+- Tags:
+  - `hook`: Name of the MCL hook being executed (e.g., "IngestionSchedulerHook", "SiblingsHook")
+- Use Case: Monitor the complete latency from request submission to hook exe
+
+#### Key Monitoring Patterns
+
+SLA Compliance by Hook:
+
+Monitor which hooks are meeting their latency SLAs:
+
+```promql
+# Percentage of requests processed within 5-minute SLA per hook
+sum(rate(datahub_request_hook_queue_time_seconds_bucket{le="300"}[5m])) by (hook)
+/ sum(rate(datahub_request_hook_queue_time_seconds_count[5m])) by (hook) * 100
+```
+
+Hook Performance Comparison:
+
+Identify which hooks have the highest latency:
+
+```promql
+# P99 latency by hook
+histogram_quantile(0.99,
+  sum by (hook, le) (
+    rate(datahub_request_hook_queue_time_seconds_bucket[5m])
+  )
+)
+```
+
+Latency Trends:
+
+Track how hook latency changes over time:
+
+```promql
+# Average hook latency trend
+avg by (hook) (
+  rate(datahub_request_hook_queue_time_seconds_sum[5m])
+  / rate(datahub_request_hook_queue_time_seconds_count[5m])
+)
+```
+
+#### Implementation Details
+
+The hook latency metric leverages the trace ID embedded in the system metadata of each request:
+
+1. Trace ID Generation: Each request generates a unique trace ID with an embedded timestamp
+1. Propagation: The trace ID flows through the entire processing pipeline via system metadata
+1. Measurement: When an MCL hook executes, the metric calculates the time difference between the current time and the trace ID timestamp
+1. Recording: The latency is recorded as a timer metric with the hook name as a tag
+
+#### Performance Considerations
+
+- Overhead: Minimal - only requires trace ID extraction and time calculation per hook execution
+- Cardinality: Low - only one tag (hook name) with typically < 20 unique values
+- Accuracy: High - measures actual wall-clock time from request to hook execution
+
+#### Relationship to Kafka Queue Time Metrics
+
+While messaging queue time metrics (`messaging.queue.time`) measure the time messages spend in the queue before consumption, request hook
+latency metrics provide the complete picture:
+
+- Kafka Queue Time: Time from message production to consumption
+- Hook Latency: Time from initial request to final hook execution
+
+Together, these metrics help identify where delays occur:
+
+- High Kafka queue time but low hook latency: Bottleneck in Kafka consumption
+- Low Kafka queue time but high hook latency: Bottleneck in processing or persistence
+- Both high: System-wide performance issues
+
+## Aspect Size Validation Metrics
+
+Emitted on all aspect writes (REST, GraphQL, MCP) to track sizes and detect oversized aspects.
+
+**Metrics:**
+
+- `aspectSizeValidation.prePatch.sizeDistribution` - Size distribution of existing aspects (tags: aspectName, sizeBucket)
+- `aspectSizeValidation.postPatch.sizeDistribution` - Size distribution of aspects being written (tags: aspectName, sizeBucket)
+- `aspectSizeValidation.prePatch.oversized` - Oversized aspects found in database (tags: aspectName, remediation)
+- `aspectSizeValidation.postPatch.oversized` - Oversized aspects rejected during writes (tags: aspectName, remediation)
+- `aspectSizeValidation.prePatch.warning` - Aspects approaching limit in database (tags: aspectName)
+- `aspectSizeValidation.postPatch.warning` - Aspects approaching limit during writes (tags: aspectName)
+
+**Configuration:**
+
+See [Aspect Size Validation](mcp-mcl.md#aspect-size-validation) for details.
+
+```yaml
+datahub:
+  validation:
+    aspectSize:
+      metrics:
+        sizeBuckets: [1048576, 5242880, 10485760, 15728640]
+```
+
+Default buckets (1MB, 5MB, 10MB, 15MB) create ranges: 0-1MB, 1MB-5MB, 5MB-10MB, 10MB-15MB, 15MB+
+
+## Primary storage read pool metrics
+
+When [primary storage read pools](../deploy/primary-storage-read-pool.md) are enabled on GMS,
+Micrometer counters track which pool served each resolution:
+
+| Metric                                     | Tags                                                                          | Meaning                                                              |
+| ------------------------------------------ | ----------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `primary_storage_target_used`              | `target` (`PRIMARY` \| `READ`), `store` (`ebean` \| `cassandra`), `forUpdate` | Pool chosen for a resolver call                                      |
+| `primary_storage_read_fallback_to_primary` | `store`                                                                       | READ preference requested but no read pool registered — used PRIMARY |
+
+Example PromQL:
+
+```promql
+# Share of aspect reads using the read pool (non-locking only)
+sum(rate(primary_storage_target_used_total{target="READ",forUpdate="false"}[5m]))
+  /
+sum(rate(primary_storage_target_used_total{forUpdate="false"}[5m]))
+
+# Fallbacks — should stay near zero when read pool is enabled
+rate(primary_storage_read_fallback_to_primary_total[5m])
+```
+
 ## Cache Monitoring (Micrometer)
 
 ### Overview
@@ -534,10 +867,11 @@ performance under load.
 ```yaml
 graphQL.concurrency:
   separateThreadPool: true
-  corePoolSize: 20 # Base threads
-  maxPoolSize: 200 # Scale under load
+  scaleWithProcessors: false # true restores availableProcessors()*5 / *100 and SynchronousQueue
+  corePoolSize: 40 # 8-core default (5 * 8); < 0 uses 5 * cores
+  maxPoolSize: 800 # 8-core cap (100 * 8); <= 0 uses 100 * cores
+  queueSize: 0 # 0 = SynchronousQueue (blocking GraphQL fan-out); > 0 = bounded queue
   keepAlive: 60 # Seconds before idle thread removal
-  # Handles complex GraphQL query resolution
 ```
 
 #### 2. Batch Processing Executors
@@ -760,6 +1094,64 @@ Key Decisions and Rationale:
    - Reduced code complexity
    - Consistent naming across telemetry types
 
+### API usage aggregation metrics
+
+GMS aggregates API usage in-memory (`datahub.usage.aggregation`), flushes on a schedule, and exports to Micrometer. This is **operational** API usage metrics for Prometheus/Grafana — distinct from [product telemetry](../deploy/telemetry.md) (anonymous usage stats) and from Kafka `DataHubUsageEvent` product analytics.
+
+**Architecture:** Requests are tagged at call sites with a `UsageOperation` key governed by `usage_operations.yaml`. Only explicitly tagged requests are recorded — untagged traffic is not aggregated. The in-memory store (`InMemoryUsageAggregationStore` in `com.linkedin.metadata.usage.store`) rolls up additive counters (requests, bytes) and distinct identity sets (active users/readers/writers), then flushes on a schedule, max window, or cardinality threshold via `AdaptiveFlushCoordinator`.
+
+**Instrumentation:**
+
+- **Classification:** Set `withUsageOperation(...)` on OpenAPI/Rest.li controllers, or rely on GraphQL classification in `SpringQueryContext` via `GraphqlUsageClassificationRegistry`. Direct Kafka/pgQueue MCP consumption on the MCE consumer records `metadata_ingest` with `request_api=messaging` when `USAGE_AGGREGATION_ENABLED=true` on MCE. Untagged routes (health checks, GraphiQL, admin) are not recorded. For GraphQL, named operations use `graphql.operation_names` entries in `usage_operations.yaml`; anonymous requests use `graphql.root_fields` overrides then code heuristics (`search*`, `scroll*`, `browse*`, `*Lineage*`). Entity GraphQL queries (including `getDataset`) classify as `metadata_query` because nested selections vary in cost — `metadata_read` is emitted from OpenAPI/Rest.li call sites only.
+- **Input bytes:** `Content-Length` from the request when available (`buildOpenapi`, `buildGraphql`, and `buildRestli` apply this automatically). Omitted when streaming/chunked or length is unknown.
+- **Output bytes:** Best-effort via `RequestContext.resolveResponseOutputBytes`; omitted (`null`) for streaming or chunked responses.
+
+**Exported metrics (on flush, default every 60s):**
+
+| Metric                            | Type    | Description                                                  |
+| --------------------------------- | ------- | ------------------------------------------------------------ |
+| `datahub_request_count`           | Counter | API requests per flush window                                |
+| `datahub.usage.input_bytes`       | Counter | Request body bytes per window (all instrumented requests)    |
+| `datahub.usage.output_bytes`      | Counter | Response body bytes per window                               |
+| `datahub.usage.active_identities` | Gauge   | Unique active users/readers/writers in the last flush window |
+
+**Tags:** `usage_operation`, `actor_class` (`regular` / `system` / `support`), `agent_class`, `request_api`, `auth_channel` (`session`, `pat`, `oauth`, `system`, `anonymous`, `unknown`) on request and byte counters. On `datahub.usage.active_identities`, only `identity_metric` (`active_users`, `active_readers`, `active_writers`) and `actor_class` are exported. The gauge is the count of **unique catalog identities** in that actor class during the flush window (one in-memory bucket per pair; empty windows publish `0` rather than omitting the series).
+
+**Actor classification:**
+
+| Tag / metric              | Source                                   | Meaning                                                                          |
+| ------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `agent_class`             | User-Agent parsing (`AgentClass`)        | Client type: browser, CLI, ingestion, SDK, etc.                                  |
+| `actor_class`             | `UsageActorClassResolver` at record time | Usage bucket: `regular`, `system`, or `support` (support users and admin actors) |
+| Legacy JMX `userCategory` | `UsageActorClass.fromActorUrn()`         | URN-only classification; support users remain `regular` on this path             |
+
+**Distinct activity metrics** (each exported on `datahub.usage.active_identities` with an `identity_metric` tag; distinct identity sets are tracked **per `actor_class`** so regular, support, and system buckets do not mix):
+
+- `active_users` — any catalog read, write, or operational activity
+- `active_readers` — catalog reads **and** operational/admin activity (`activity_class: operation` in `usage_operations.yaml`)
+- `active_writers` — catalog metadata writes and deletes (`activity_class: write` with `default_cost_units > 0` in `usage_operations.yaml`; zero-cost writes such as `other_write` count toward `active_users` only)
+
+**MCE consumer:** Can run the same aggregation stack for queue-path `metadata_ingest` (`request_api=messaging`); MAE and upgrade force `datahub.usage.aggregation.enabled=false`. Async REST ingest is counted on GMS only — GMS stamps `X-DataHub-Usage-PreRecorded` on the outbound MCP `headers` map so MCE does not double-count (transport-agnostic across Kafka and pgQueue).
+
+**Flush retries:** The store retries the Micrometer flush sink on failure. `UsageFlushSinkComposer` tracks which delegates already succeeded for a given batch and skips them on retry so counters are not double-counted.
+
+**Flush window alignment (optional):** Set `USAGE_AGGREGATION_ALIGNMENT_PERIOD_SECONDS` to an arbitrary positive period in seconds (`0` default = disabled). Alignment **only splits** closed windows at the next UTC calendar boundary via `alignDown` / `nextBoundary` — it does **not** rewrite window open times to the grid floor. Mid-period windows keep process-relative open/close (`[start, flushTime)`); the next window opens at that flush Instant (or at the boundary Instant when a drain crosses one). Multiple batches per period are normal — sum additive counters and union distinct identities by grouping on `alignDown(window_start)` for the configured `N` seconds (examples: `60`, `300`, `3600`, `86400`). The coordinator still ticks on `USAGE_AGGREGATION_FLUSH_INTERVAL_SECONDS` (default 60s) and flushes before the next boundary when within one interval of it. Keep the flush interval > 0 when alignment is enabled; with `scheduledIntervalSeconds=0`, flushes rely on `maxWindowSeconds` and cardinality triggers only, which can miss boundary timing unless `maxWindowSeconds` divides the alignment period cleanly.
+
+Only instrumented requests are aggregated. Set `USAGE_AGGREGATION_ENABLED=true` to enable (default `false` in `application.yaml`; Docker quickstart and debug compose default to `true`, with flush interval `30` and alignment period `3600`).
+
+**Legacy JMX metrics:** `requestContext_{userCategory}_{agentClass}_{requestAPI}` Dropwizard counters are unchanged. `userCategory` is derived from `UsageActorClass.fromActorUrn()`.
+
+**Example PromQL:**
+
+```promql
+sum by (usage_operation) (rate(datahub_request_count[5m]))
+sum(rate(datahub.usage.input_bytes[5m]))
+# Total metadata_ingest across GMS (openapi/restli) and MCE (messaging):
+sum by (request_api) (rate(datahub_request_count{usage_operation="metadata_ingest"}[5m]))
+```
+
+`usage_operation` is bounded by the yaml-governed taxonomy (≤12 keys) — do not expect per-GraphQL-operation-name series.
+
 ### Future State
 
 <p align="center">
@@ -796,6 +1188,14 @@ scrape from 4318 ports of each container used by the JMX exporter to export metr
 listen to prometheus and create useful dashboards. By default, we provide two
 dashboards: [JVM dashboard](https://grafana.com/grafana/dashboards/14845) and DataHub dashboard.
 
+**Micrometer (Spring Actuator / Play):** Docker images for GMS, MAE consumer, MCE consumer, and the Play frontend set
+`MANAGEMENT_SERVER_PORT` to **4319** by default (see container `start.sh`). Micrometer Prometheus text is served at
+`http://<container>:4319/actuator/prometheus` on a separate HTTP listener (reachable on the Docker network; quickstart compose **`expose`s** this port rather than publishing it to the host). JVM/JMX metrics remain on **4318** when
+`ENABLE_PROMETHEUS=true`. The example [prometheus.yaml](../../docker/monitoring/prometheus.yaml) includes a `micrometer`
+scrape job for port **4319**. Outside Docker, leave `MANAGEMENT_SERVER_PORT` unset so Actuator stays on the main
+application port; set it when you want a separate management listener (Spring maps the env var to
+`management.server.port`).
+
 In the JVM dashboard, you can find detailed charts based on JVM metrics like CPU/memory/disk usage. In the DataHub
 dashboard, you can find charts to monitor each endpoint and the kafka topics. Using the example implementation, go
 to http://localhost:3001 to find the grafana dashboards! (Username: admin, PW: admin)
@@ -827,19 +1227,22 @@ You can add in the above docker-compose using the `-f <<path-to-compose-file>>` 
 For instance,
 
 ```shell
-docker-compose \
-  -f quickstart/docker-compose.quickstart.yml \
-  -f monitoring/docker-compose.monitoring.yml \
+docker compose --project-directory docker/profiles --profile quickstart \
+  -f docker/monitoring/docker-compose.monitoring.yml \
   pull && \
-docker-compose -p datahub \
-  -f quickstart/docker-compose.quickstart.yml \
-  -f monitoring/docker-compose.monitoring.yml \
+docker compose --project-directory docker/profiles --profile quickstart -p datahub \
+  -f docker/monitoring/docker-compose.monitoring.yml \
   up
 ```
 
-We set up quickstart.sh, dev.sh, and dev-without-neo4j.sh to add the above docker-compose when MONITORING=true. For
-instance `MONITORING=true ./docker/quickstart.sh` will add the correct env variables to start collecting traces and
-metrics, and also deploy Jaeger, Prometheus, and Grafana. We will soon support this as a flag during quickstart.
+For local development with debug images, use the `debug` profile instead of `quickstart`:
+
+```shell
+docker compose --project-directory docker/profiles --profile debug \
+  -f docker/monitoring/docker-compose.monitoring.yml up
+```
+
+Or start the base stack with `./gradlew quickstartDebug` and add monitoring compose files as needed.
 
 ## Health check endpoint
 

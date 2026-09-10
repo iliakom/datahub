@@ -15,6 +15,7 @@ import java.lang.reflect.Field;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import org.mockito.Mock;
@@ -153,32 +154,6 @@ public class MicrometerMetricsRegistryTest {
 
     // Then
     assertFalse(result);
-  }
-
-  @Test
-  public void testRegisterCacheWithNullNativeCache() {
-    // Given
-    String cacheName = "testCache";
-
-    // When
-    boolean result = MicrometerMetricsRegistry.registerCacheMetrics(cacheName, null, meterRegistry);
-
-    // Then
-    assertFalse(result);
-  }
-
-  @Test
-  public void testRegisterCacheWithNullCacheName() {
-    // Given
-    Cache<Object, Object> caffeineCache =
-        Caffeine.newBuilder().maximumSize(100).recordStats().build();
-
-    // When
-    boolean result =
-        MicrometerMetricsRegistry.registerCacheMetrics(null, caffeineCache, meterRegistry);
-
-    // Then
-    assertFalse(result); // Should return false for null cache name
   }
 
   @Test
@@ -350,30 +325,6 @@ public class MicrometerMetricsRegistryTest {
     assertEquals(registeredCaches.size(), 1);
     String registeredKey = registeredCaches.iterator().next();
     assertEquals(registeredKey, cacheName);
-  }
-
-  @Test
-  public void testAllNullParameters() {
-    // When
-    boolean result = MicrometerMetricsRegistry.registerCacheMetrics(null, null, null);
-
-    // Then
-    assertFalse(result);
-  }
-
-  @Test
-  public void testNullCheckOrder() {
-    // Test various combinations of null parameters
-
-    // Null cache name
-    Cache<Object, Object> caffeineCache = Caffeine.newBuilder().maximumSize(100).build();
-    assertFalse(MicrometerMetricsRegistry.registerCacheMetrics(null, caffeineCache, meterRegistry));
-
-    // Null native cache
-    assertFalse(MicrometerMetricsRegistry.registerCacheMetrics("test", null, meterRegistry));
-
-    // Null meter registry
-    assertFalse(MicrometerMetricsRegistry.registerCacheMetrics("test", caffeineCache, null));
   }
 
   @Test
@@ -771,6 +722,42 @@ public class MicrometerMetricsRegistryTest {
                           && executorName.equals(meter.getId().getTag("name"))));
     } finally {
       threadPoolExecutor.shutdown();
+    }
+  }
+
+  @Test
+  public void testForkJoinPoolSpecificMetrics() {
+    // A ForkJoinPool (e.g. ForkJoinPool.commonPool(), used by GraphQL when no separate thread pool
+    // is configured) is an ExecutorService, so it must be instrumentable. Micrometer emits a
+    // different metric set for it than for ThreadPoolExecutor: executor.queued (not
+    // executor.queued.tasks), executor.steals/active/running/pool.size, and executor.parallelism.
+    String executorName = "forkJoinPool";
+    ForkJoinPool forkJoinPool = new ForkJoinPool(2);
+
+    try {
+      boolean result =
+          MicrometerMetricsRegistry.registerExecutorMetrics(
+              executorName, forkJoinPool, meterRegistry);
+
+      assertTrue(result);
+
+      // ForkJoinPool uses executor.queued (not executor.queued.tasks used by ThreadPoolExecutor)
+      assertTrue(
+          meterRegistry.getMeters().stream()
+              .anyMatch(
+                  meter ->
+                      meter.getId().getName().contains("executor.queued")
+                          && executorName.equals(meter.getId().getTag("name"))));
+
+      // executor.steals is unique to ForkJoinPool instrumentation
+      assertTrue(
+          meterRegistry.getMeters().stream()
+              .anyMatch(
+                  meter ->
+                      meter.getId().getName().contains("executor.steals")
+                          && executorName.equals(meter.getId().getTag("name"))));
+    } finally {
+      forkJoinPool.shutdown();
     }
   }
 
